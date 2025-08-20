@@ -13,12 +13,11 @@
     "isolatedModules": true,
     "jsx": "preserve",
     "incremental": true,
-  "plugins": [
+    "plugins": [
       {
         "name": "next"
       }
     ],
-  "types": ["node"],
     "paths": {
       "@/*": ["./*"]
     }
