@@ -10,6 +10,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Heart, Brain, Zap, Activity, Play, Pause, RotateCcw } from "lucide-react"
+import { GradientBar } from "./components/gradient-bar"
+import { NavBar } from "./components/NavBar"
 
 // Mock data generation for demonstration
 const generateMockData = () => ({
@@ -22,6 +24,8 @@ const generateMockData = () => ({
 export default function StressDashboard() {
   const [isMonitoring, setIsMonitoring] = useState(false)
   const [currentMetrics, setCurrentMetrics] = useState(generateMockData())
+  const [cameraConnected, setCameraConnected] = useState(false)
+
   // const [chartData, setChartData] = useState({
   //   stress: [] as Array<{ time: string; value: number }>,
   //   breathing: [] as Array<{ time: string; value: number }>,
@@ -47,6 +51,15 @@ export default function StressDashboard() {
 
     return () => clearInterval(interval)
   }, [isMonitoring])
+
+  useEffect(() => {
+    if (!cameraConnected && isMonitoring) {
+      // Camera closed while monitoring
+      handleStopMonitoring()
+    }
+  }, [cameraConnected, isMonitoring])
+
+
 
   const getStressStatus = (level: number) => {
     if (level < 20) return "excellent"
@@ -85,36 +98,47 @@ export default function StressDashboard() {
     setCurrentMetrics(generateMockData())
   }
 
-  return (
-    <div className="min-h-screen bg-background p-10 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-foreground">Stress & Anxiety Monitor</h1>
-          <p className="text-muted-foreground">Real-time biometric analysis dashboard</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={isMonitoring ? "default" : "secondary"} className="px-3 py-1">
-            {isMonitoring ? "MONITORING" : "STANDBY"}
-          </Badge>
-        </div>
-      </div>
 
-      {/* Control Panel */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Activity className="h-5 w-5" />
-            Control Panel
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex items-center gap-4">
+  return (
+    <>
+      <nav className="sticky top-0 left-0 w-full bg-background border-b border-border z-50 px-10 py-4 flex flex-wrap items-center justify-between gap-1">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">Stress & Anxiety Monitor</h1>
+          <p className="text-sm text-muted-foreground">Real-time biometric analysis dashboard</p>
+        </div>
+
+
+        <div className="flex justify-end gap-4">
+
+
+          <div className="flex items-center gap-2">
+            <span
+              className={`
+      h-2 w-2 rounded-full 
+      ${isMonitoring ? "bg-green-500 animate-pulse" : "bg-red-500"}
+    `}
+            />
+            <span className="font-sm text-sm">
+              {isMonitoring ? "ACTIVE" : "INACTIVE"}
+            </span>
+          </div>
+
+          {/* <Badge
+            variant={isMonitoring ? "default" : "secondary"}
+            className="px-3 py-1"
+          >
+            {isMonitoring ? "MONITORING" : "STANDBY"}
+          </Badge> */}
+
+
+
           <Button
             onClick={isMonitoring ? handleStopMonitoring : handleStartMonitoring}
             variant={isMonitoring ? "destructive" : "default"}
             className="flex items-center gap-2"
+            disabled={!cameraConnected}
           >
-            {isMonitoring ? (
+            {isMonitoring && cameraConnected ? (
               <>
                 <Pause className="h-4 w-4" />
                 Stop Monitoring
@@ -130,103 +154,192 @@ export default function StressDashboard() {
             <RotateCcw className="h-4 w-4" />
             Reset
           </Button>
-        </CardContent>
-      </Card>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Camera Feed */}
-        <div className="lg:col-span-1">
-          <CameraFeed />
         </div>
 
-        {/* Metrics Cards */}
-        <div className="lg:col-span-2 space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <MetricCard
-              title="Stress Level"
-              value={currentMetrics.stressLevel}
-              status={
-                currentMetrics.stressLevel < 30
-                  ? "low"
-                  : currentMetrics.stressLevel < 60
-                    ? "normal"
-                    : currentMetrics.stressLevel < 80
-                      ? "high"
-                      : "critical"
-              }
-              icon={<Brain className="h-4 w-4" />}
-            />
-            <MetricCard
-              title="Breathing Rate"
-              value={currentMetrics.breathingRate}
-              unit=" bpm"
-              status={currentMetrics.breathingRate >= 12 && currentMetrics.breathingRate <= 16 ? "normal" : "high"}
-              icon={<Activity className="h-4 w-4" />}
-            />
-            <MetricCard
-              title="Confidence Level"
-              value={currentMetrics.confidenceLevel}
-              status={currentMetrics.confidenceLevel > 80 ? "normal" : "low"}
-              icon={<Zap className="h-4 w-4" />}
-            />
-            <MetricCard
-              title="Heart Rate"
-              value={currentMetrics.heartRate}
-              unit=" bpm"
-              status={currentMetrics.heartRate >= 60 && currentMetrics.heartRate <= 80 ? "normal" : "high"}
-              icon={<Heart className="h-4 w-4" />}
-            />
+      </nav>
+
+
+
+
+      <div className="min-h-screen bg-background p-10 space-y-6">
+
+        {/* Header */}
+        {/* <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-foreground">Stress & Anxiety Monitor</h1>
+          <p className="text-muted-foreground">Real-time biometric analysis dashboard</p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Badge variant={isMonitoring ? "default" : "secondary"} className="px-3 py-1">
+            {isMonitoring ? "MONITORING" : "STANDBY"}
+          </Badge>
+        </div>
+      </div> */}
+
+
+
+
+
+
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Camera Feed */}
+          <div className="space-y-6">
+            <CameraFeed onCameraStatusChange={(connected) => setCameraConnected(connected)} />
+            {/* Status Indicators */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Overall Status</CardTitle>
+              </CardHeader>
+              <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <StatusIndicator status={getStressStatus(currentMetrics.stressLevel)} label="Stress Level" />
+                <StatusIndicator status={getBreathingStatus(currentMetrics.breathingRate)} label="Breathing Pattern" />
+                <StatusIndicator
+                  status={
+                    currentMetrics.confidenceLevel > 80
+                      ? "excellent"
+                      : currentMetrics.confidenceLevel > 60
+                        ? "good"
+                        : "moderate"
+                  }
+                  label="Analysis Confidence"
+                />
+              </CardContent>
+            </Card>
           </div>
 
-          {/* Status Indicators */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Overall Status</CardTitle>
-            </CardHeader>
-            <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <StatusIndicator status={getStressStatus(currentMetrics.stressLevel)} label="Stress Level" />
-              <StatusIndicator status={getBreathingStatus(currentMetrics.breathingRate)} label="Breathing Pattern" />
-              <StatusIndicator
+          {/* Metrics Cards */}
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <MetricCard
+                title="Stress Level"
+                value={currentMetrics.stressLevel}
                 status={
-                  currentMetrics.confidenceLevel > 80
-                    ? "excellent"
-                    : currentMetrics.confidenceLevel > 60
-                      ? "good"
-                      : "moderate"
+                  currentMetrics.stressLevel < 30
+                    ? "low"
+                    : currentMetrics.stressLevel < 60
+                      ? "normal"
+                      : currentMetrics.stressLevel < 80
+                        ? "high"
+                        : "critical"
                 }
-                label="Analysis Confidence"
+                icon={<Brain className="h-4 w-4" />}
+                variant="stress"
               />
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+              <MetricCard
+                title="Breathing Rate"
+                value={currentMetrics.breathingRate}
+                unit=" bpm"
+                status={currentMetrics.breathingRate >= 12 && currentMetrics.breathingRate <= 16 ? "normal" : "high"}
+                icon={<Activity className="h-4 w-4" />}
+                variant="breathing"
+              />
+              <MetricCard
+                title="Confidence Level"
+                value={currentMetrics.confidenceLevel}
+                status={currentMetrics.confidenceLevel > 80 ? "normal" : "low"}
+                icon={<Zap className="h-4 w-4" />}
+                variant="confidence"
+              />
+              <MetricCard
+                title="Heart Rate"
+                value={currentMetrics.heartRate}
+                unit=" bpm"
+                status={currentMetrics.heartRate >= 60 && currentMetrics.heartRate <= 80 ? "normal" : "high"}
+                icon={<Heart className="h-4 w-4" />}
+                variant="heart"
+              />
+            </div>
 
-      {/* Live Charts
+            {/* Progress Bars Section */}
+            {/* <Card>
+            <CardHeader>
+              <CardTitle>Detailed Metrics</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <ProgressBar
+                label="Stress Level"
+                value={currentMetrics.stressLevel}
+                color={currentMetrics.stressLevel < 50 ? "success" : currentMetrics.stressLevel < 75 ? "warning" : "danger"}
+              />
+              <ProgressBar
+                label="Breathing Stability"
+                value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)}
+                color="primary"
+              />
+              <ProgressBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} color="secondary" />
+            </CardContent>
+          </Card> */}
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Detailed Metrics</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <GradientBar label="Stress Level" value={currentMetrics.stressLevel} />
+                <GradientBar label="Breathing Stability" value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)} />
+                <GradientBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} />
+                {/* <ProgressBar
+                label="Stress Level"
+                value={currentMetrics.stressLevel}
+                color={currentMetrics.stressLevel < 50 ? "success" : currentMetrics.stressLevel < 75 ? "warning" : "danger"}
+              />
+              <ProgressBar
+                label="Breathing Stability"
+                value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)}
+                color="primary"
+              />
+              <ProgressBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} color="secondary" /> */}
+              </CardContent>
+            </Card>
+
+          </div>
+        </div>
+
+        {/* Live Charts
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <LiveChart title="Stress Level Trend" data={chartData.stress} color="chart-1" yAxisDomain={[0, 100]} />
         <LiveChart title="Breathing Rate" data={chartData.breathing} color="chart-2" yAxisDomain={[8, 24]} />
         <LiveChart title="Confidence Level" data={chartData.confidence} color="chart-3" yAxisDomain={[0, 100]} />
       </div> */}
 
-      {/* Progress Bars Section */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Detailed Metrics</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <ProgressBar
-            label="Stress Level"
-            value={currentMetrics.stressLevel}
-            color={currentMetrics.stressLevel < 50 ? "success" : currentMetrics.stressLevel < 75 ? "warning" : "danger"}
-          />
-          <ProgressBar
-            label="Breathing Stability"
-            value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)}
-            color="primary"
-          />
-          <ProgressBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} color="secondary" />
-        </CardContent>
-      </Card>
-    </div>
+
+
+        {/* Control Panel */}
+        {/* <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Activity className="h-5 w-5" />
+              Control Panel
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex items-center gap-4">
+            <Button
+              onClick={isMonitoring ? handleStopMonitoring : handleStartMonitoring}
+              variant={isMonitoring ? "destructive" : "default"}
+              className="flex items-center gap-2"
+            >
+              {isMonitoring ? (
+                <>
+                  <Pause className="h-4 w-4" />
+                  Stop Monitoring
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4" />
+                  Start Monitoring
+                </>
+              )}
+            </Button>
+            <Button onClick={handleReset} variant="outline" className="flex items-center gap-2 bg-transparent">
+              <RotateCcw className="h-4 w-4" />
+              Reset
+            </Button>
+          </CardContent>
+        </Card> */}
+
+      </div>
+    </>
   )
 }

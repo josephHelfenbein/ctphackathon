@@ -150,7 +150,7 @@ body {
   --card-foreground: oklch(0.35 0 0); /* Dark gray text on cards */
   --popover: oklch(1 0 0); /* White popover background */
   --popover-foreground: oklch(0.35 0 0); /* Dark gray popover text */
-  --primary: oklch(0.55 0.15 200); /* Calming cyan-600 for primary actions */
+  --primary: oklch(65.785% 0.22047 141.978); /* Calming cyan-600 for primary actions */
   --primary-foreground: oklch(1 0 0); /* White text on primary */
   --secondary: oklch(0.75 0.12 85); /* Warm amber for highlights */
   --secondary-foreground: oklch(1 0 0); /* White text on secondary */
