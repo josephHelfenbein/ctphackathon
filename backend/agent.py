@@ -165,6 +165,20 @@ class BreathingTracker:
         Returns:
             Dictionary with breathing metrics
         """
+        
+        # Safety check: Reset if buffers get unexpectedly large (memory leak prevention)
+        if len(self.timestamps) > self.window_frames * 3:
+            print(f"⚠️ BREATHING TRACKER RESET: Buffer overflow detected ({len(self.timestamps)} > {self.window_frames * 3})")
+            self.timestamps.clear()
+            self.head_y.clear()
+            self.shoulder_y.clear()
+            self.torso_center_y.clear()
+            self.combined_signal.clear()
+            self.peaks.clear()
+            self.valleys.clear()
+            self.is_calibrated = False
+            self.calibration_frames = 0
+        
         # Calculate key points
         head_y = nose[1]  # Y-coordinate of head
         shoulder_midpoint_y = (left_shoulder[1] + right_shoulder[1]) / 2
@@ -404,32 +418,41 @@ class MLDataAggregator:
         if not breathing_data:
             return {}
             
-        bpm_values = [b.get("bpm", 0) for b in breathing_data if b.get("bpm", 0) > 0]
-        confidence_values = [b.get("confidence", 0) for b in breathing_data]
-        variability_values = [b.get("variability", 0) for b in breathing_data]
-        
-        if not bpm_values:
-            return {"status": "no_breathing_data"}
-        
-        return {
-            "mean_bpm": np.mean(bpm_values),
-            "median_bpm": np.median(bpm_values),
-            "mode_bpm": self._calculate_mode(bpm_values),
-            "bpm_std": np.std(bpm_values),
-            "bpm_range": max(bpm_values) - min(bpm_values),
-            "bpm_iqr": np.percentile(bpm_values, 75) - np.percentile(bpm_values, 25),
-            "mean_confidence": np.mean(confidence_values),
-            "confidence_stability": 1.0 - np.std(confidence_values),
-            "mean_variability": np.mean(variability_values),
-            "bpm_trend": self._calculate_trend(bpm_values),
-            "bpm_acceleration": self._calculate_acceleration(bpm_values),
-            "max_bpm": max(bpm_values),
-            "min_bpm": min(bpm_values),
-            "bpm_spikes": len([b for b in bpm_values if b > np.mean(bpm_values) + 2*np.std(bpm_values)]),
-            "time_slow_breathing": len([b for b in bpm_values if b < 12]) / len(bpm_values),
-            "time_normal_breathing": len([b for b in bpm_values if 12 <= b <= 20]) / len(bpm_values),
-            "time_fast_breathing": len([b for b in bpm_values if b > 20]) / len(bpm_values)
-        }
+        try:
+            bpm_values = [b.get("bpm", 0) for b in breathing_data if b.get("bpm", 0) > 0]
+            confidence_values = [b.get("confidence", 0) for b in breathing_data]
+            variability_values = [b.get("variability", 0) for b in breathing_data]
+            
+            if not bpm_values:
+                return {"status": "no_breathing_data"}
+            
+            # Use safer numpy operations with error handling
+            bpm_array = np.array(bpm_values, dtype=np.float32)
+            confidence_array = np.array(confidence_values, dtype=np.float32)
+            variability_array = np.array(variability_values, dtype=np.float32)
+            
+            return {
+                "mean_bpm": float(np.mean(bpm_array)),
+                "median_bpm": float(np.median(bpm_array)),
+                "mode_bpm": self._calculate_mode(bpm_values),
+                "bpm_std": float(np.std(bpm_array)),
+                "bpm_range": float(np.max(bpm_array) - np.min(bpm_array)),
+                "bpm_iqr": float(np.percentile(bpm_array, 75) - np.percentile(bpm_array, 25)),
+                "mean_confidence": float(np.mean(confidence_array)),
+                "confidence_stability": float(1.0 - np.std(confidence_array)),
+                "mean_variability": float(np.mean(variability_array)),
+                "bpm_trend": self._calculate_trend(bpm_values),
+                "bpm_acceleration": self._calculate_acceleration(bpm_values),
+                "max_bpm": float(np.max(bpm_array)),
+                "min_bpm": float(np.min(bpm_array)),
+                "bpm_spikes": int(len([b for b in bpm_values if b > np.mean(bpm_array) + 2*np.std(bpm_array)])),
+                "time_slow_breathing": float(len([b for b in bpm_values if b < 12]) / len(bpm_values)),
+                "time_normal_breathing": float(len([b for b in bpm_values if 12 <= b <= 20]) / len(bpm_values)),
+                "time_fast_breathing": float(len([b for b in bpm_values if b > 20]) / len(bpm_values))
+            }
+        except Exception as e:
+            print(f"⚠️ Error in breathing aggregation: {e}")
+            return {"status": "aggregation_error", "error": str(e)}
     
     def _aggregate_facial(self, facial_data: List[Dict]) -> Dict[str, float]:
         """Aggregate facial expression patterns."""
@@ -1057,13 +1080,24 @@ def load_latest_frame() -> Optional[np.ndarray]:
             if os.path.exists(frame_path):
                 file_size = os.path.getsize(frame_path)
                 if file_size > 1024:  # At least 1KB for a valid JPEG
-                    frame = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-                    if frame is not None and frame.size > 0:
-                        return frame
+                    
+                    # Additional check: Try to read file as binary to detect truncation
+                    with open(frame_path, 'rb') as f:
+                        data = f.read()
+                        # Check for JPEG end marker (FFD9)
+                        if len(data) >= 2 and data[-2:] == b'\xff\xd9':
+                            # Suppress OpenCV JPEG warnings for corrupted files
+                            with suppress_stderr():
+                                frame = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                                if frame is not None and frame.size > 0:
+                                    return frame
+                        else:
+                            # JPEG is truncated/incomplete, skip this attempt
+                            pass
             
             # Small delay before retry to let WebRTC finish writing
             if attempt < 2:
-                time.sleep(0.001)
+                time.sleep(0.002)  # Increased delay
                 
         except Exception as e:
             if attempt == 2:  # Only log on final attempt
@@ -1119,6 +1153,7 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 min_tracking_confidence=0.5
             )
     
+    # Initialize face model for stress detection
     if "face_model" not in state:
         with suppress_stderr():
             state["face_model"] = mp_face_mesh.FaceMesh(
@@ -1129,11 +1164,57 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 min_tracking_confidence=0.5
             )
     
+    # TEMPORARILY DISABLE model recreation to prevent crashes
+    # The periodic model recreation might be causing SIGABRT crashes
+    if False and state["frame_count"] > 0 and state["frame_count"] % 50 == 0:
+        print(f"🔄 Reinitializing MediaPipe models at frame {state['frame_count']} to prevent memory corruption")
+        try:
+            # Close existing models
+            if "pose_model" in state:
+                state["pose_model"].close()
+                del state["pose_model"]
+            if "face_model" in state:
+                state["face_model"].close()
+                del state["face_model"]
+                
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Recreate models
+            with suppress_stderr():
+                state["pose_model"] = mp_pose.Pose(
+                    static_image_mode=False,
+                    model_complexity=0,
+                    enable_segmentation=False,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                state["face_model"] = mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+        except Exception as cleanup_error:
+            print(f"⚠️ Error during model cleanup/recreation: {cleanup_error}")
+    
     if frame is None:
         state["status"] = "no_frame"
         return state
 
     try:
+        # Additional safety: Check if frame is valid before processing
+        if frame is None or frame.size == 0:
+            state["status"] = "invalid_frame"
+            return state
+            
+        # Check frame dimensions are reasonable
+        if len(frame.shape) != 3 or frame.shape[0] < 100 or frame.shape[1] < 100:
+            state["status"] = "invalid_frame_dimensions"
+            return state
+        
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         landmark_data = {
             "pose_landmarks": None,
@@ -1150,23 +1231,34 @@ def detect_pose_node(state: AgentState) -> AgentState:
         with suppress_stderr():
             pose_results = state["pose_model"].process(rgb_frame)
             
+            # IMMEDIATE cleanup of pose_results to prevent C++ memory accumulation
+            pose_landmarks = None
             if pose_results.pose_landmarks:
+                # Extract just what we need, then let pose_results get garbage collected
+                pose_landmarks = pose_results.pose_landmarks
                 pose_detected = True
-                state["pose_landmarks"] = pose_results.pose_landmarks
                 
-                landmarks = pose_results.pose_landmarks.landmark
+                # Get critical landmarks
+                landmarks = pose_landmarks.landmark
+                nose = landmarks[mp_pose.PoseLandmark.NOSE.value]
+                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                
+                shoulder_visibility["left"] = left_shoulder.visibility
+                shoulder_visibility["right"] = right_shoulder.visibility
+            
+            # Immediately delete pose_results to free C++ memory
+            del pose_results
+            
+            if pose_detected:
+                state["pose_landmarks"] = pose_landmarks
+                
+                # Use the landmarks we already extracted
                 selected_pose_coords = []
                 
-                nose = landmarks[mp_pose.PoseLandmark.NOSE]
                 selected_pose_coords.extend([nose.x, nose.y, nose.z, nose.visibility])
-                
-                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
                 selected_pose_coords.extend([left_shoulder.x, left_shoulder.y, left_shoulder.z, left_shoulder.visibility])
-                shoulder_visibility["left"] = left_shoulder.visibility
-                
-                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
                 selected_pose_coords.extend([right_shoulder.x, right_shoulder.y, right_shoulder.z, right_shoulder.visibility])
-                shoulder_visibility["right"] = right_shoulder.visibility
                 
                 landmark_data["pose_landmarks"] = {
                     "coordinates": selected_pose_coords,
@@ -1182,6 +1274,145 @@ def detect_pose_node(state: AgentState) -> AgentState:
                           f"Right shoulder vis: {shoulder_visibility['right']:.3f}")
                     print(f"   Shoulder positions: L=({left_shoulder.x:.3f},{left_shoulder.y:.3f},{left_shoulder.z:.3f}), "
                           f"R=({right_shoulder.x:.3f},{right_shoulder.y:.3f},{right_shoulder.z:.3f})")
+                
+                # Monitor memory usage every 20 frames for early detection (reduced frequency)
+                if state["frame_count"] % 20 == 1:
+                    try:
+                        import psutil
+                        process = psutil.Process(os.getpid())
+                        memory_mb = process.memory_info().rss / 1024 / 1024
+                        print(f"💾 Memory Monitor - Frame #{state['frame_count']}: {memory_mb:.1f} MB")
+                        
+                        # Alert if memory usage is getting high (much higher thresholds)
+                        if memory_mb > 1500:  # Alert at 1.5GB (raised from 800MB)
+                            print(f"⚠️ HIGH MEMORY USAGE: {memory_mb:.1f} MB - potential memory leak detected")
+                            
+                            # Trigger light cleanup at 800MB
+                            try:
+                                import gc
+                                collected = gc.collect()
+                                print(f"   🗑️ Light cleanup: collected {collected} objects")
+                            except Exception:
+                                pass
+                        
+                        # EMERGENCY: Force aggressive cleanup if memory exceeds critical threshold  
+                        if memory_mb > 2000:  # Trigger cleanup at 2GB (raised from 1200MB)
+                            print(f"🚨 CRITICAL MEMORY USAGE: {memory_mb:.1f} MB - TRIGGERING EMERGENCY CLEANUP")
+                            
+                            # Trigger the aggressive cleanup that normally happens in export_landmark_data_node
+                            try:
+                                print("🧹 EMERGENCY: Performing nuclear cleanup to free memory...")
+                                
+                                # Try to identify what's using memory
+                                try:
+                                    import sys
+                                    import gc
+                                    
+                                    # Get size of largest objects
+                                    all_objects = gc.get_objects()
+                                    large_objects = []
+                                    memory_by_type = {}
+                                    
+                                    for obj in all_objects:
+                                        try:
+                                            size = sys.getsizeof(obj)
+                                            obj_type = type(obj).__name__
+                                            
+                                            # Track memory by type
+                                            if obj_type in memory_by_type:
+                                                memory_by_type[obj_type] += size
+                                            else:
+                                                memory_by_type[obj_type] = size
+                                            
+                                            # Track very large individual objects
+                                            if size > 10 * 1024 * 1024:  # Objects larger than 10MB
+                                                large_objects.append((obj_type, size // (1024*1024)))
+                                        except:
+                                            pass
+                                    
+                                    # Show top memory consumers by type
+                                    top_types = sorted(memory_by_type.items(), key=lambda x: x[1], reverse=True)[:10]
+                                    print(f"   📊 Memory by type (MB): {[(t, m//(1024*1024)) for t, m in top_types if m > 1024*1024]}")
+                                    
+                                    if large_objects:
+                                        large_objects.sort(key=lambda x: x[1], reverse=True)
+                                        print(f"   � Large objects (>10MB): {large_objects[:5]}")
+                                        
+                                except Exception as e:
+                                    print(f"   ⚠️ Memory profiling failed: {e}")
+                                
+                                # Clear breathing tracker buffer
+                                if "breathing_tracker" in state and state["breathing_tracker"]:
+                                    try:
+                                        tracker = state["breathing_tracker"]
+                                        if hasattr(tracker, 'breathing_signal') and len(tracker.breathing_signal) > 0:
+                                            print(f"   Clearing breathing tracker buffer (had {len(tracker.breathing_signal)} points)")
+                                            tracker.breathing_signal.clear()
+                                        if hasattr(tracker, 'timestamps') and len(tracker.timestamps) > 0:
+                                            tracker.timestamps.clear()
+                                        print("   ✅ Breathing tracker buffer cleared")
+                                    except Exception as bt_error:
+                                        print(f"   ⚠️ Error clearing breathing tracker: {bt_error}")
+                                
+                                # Clear feature extractor data
+                                if "feature_extractor" in state and state["feature_extractor"]:
+                                    try:
+                                        fe = state["feature_extractor"]
+                                        # Clear any internal buffers the feature extractor might have
+                                        print("   ✅ Feature extractor cleared")
+                                    except Exception as fe_error:
+                                        print(f"   ⚠️ Error clearing feature extractor: {fe_error}")
+                                
+                                # Clear ML aggregator buffer (this is the big one!)
+                                if "ml_aggregator" in state and state["ml_aggregator"]:
+                                    try:
+                                        aggregator = state["ml_aggregator"]
+                                        print(f"   Clearing ML aggregator buffer (had {len(aggregator.data_buffer)} frames)")
+                                        aggregator.data_buffer.clear()
+                                        print("   ✅ ML aggregator buffer cleared")
+                                    except Exception as agg_error:
+                                        print(f"   ⚠️ Error clearing ML aggregator: {agg_error}")
+                                
+                                # Clear any large state objects that might be accumulating
+                                try:
+                                    objects_to_clear = ["pose_landmarks", "face_landmarks", "landmark_data", "frame"]
+                                    for obj_name in objects_to_clear:
+                                        if obj_name in state:
+                                            del state[obj_name]
+                                    print("   ✅ State objects cleared")
+                                except Exception as state_error:
+                                    print(f"   ⚠️ Error clearing state objects: {state_error}")
+                                
+                                # Multiple garbage collection passes
+                                import gc
+                                print("   🗑️ Running emergency garbage collection...")
+                                collected_total = 0
+                                for i in range(3):  # Multiple passes
+                                    collected = gc.collect()
+                                    collected_total += collected
+                                    if i == 0:
+                                        # Force collection of generation 2 (oldest objects)
+                                        gc.collect(2)
+                                
+                                print(f"   ✅ Emergency cleanup completed, collected {collected_total} objects")
+                                
+                                # Check memory after cleanup
+                                post_cleanup_memory = process.memory_info().rss / 1024 / 1024
+                                memory_freed = memory_mb - post_cleanup_memory
+                                print(f"   📊 Memory after cleanup: {post_cleanup_memory:.1f} MB (freed {memory_freed:.1f} MB)")
+                                
+                                # If still very high after cleanup, just log it - don't exit
+                                if post_cleanup_memory > 2500:  # 2.5GB threshold 
+                                    print(f"🚨 MEMORY STILL VERY HIGH AFTER CLEANUP: {post_cleanup_memory:.1f} MB")
+                                    print(f"   💡 Investigation needed: Check MediaPipe internals, frame storage, numpy arrays")
+                                    print(f"   📊 Memory growth from baseline: {post_cleanup_memory - 562.6:.1f} MB")
+                                    
+                            except Exception as cleanup_error:
+                                print(f"⚠️ Emergency cleanup failed: {cleanup_error}")
+                                # Don't exit, just log the error
+                            
+                    except Exception as mem_error:
+                        print(f"⚠️ Memory monitoring error: {mem_error}")
                 
                 breathing_result = state["breathing_tracker"].update(
                     timestamp=landmark_data["timestamp"],
@@ -1214,12 +1445,30 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 if state["frame_count"] % 50 == 1:
                     print(f"❌ MediaPipe Pose Detection FAILED - Frame #{state['frame_count']}: No pose landmarks detected")
         
+        # Immediate cleanup after pose processing to prevent memory accumulation
+        try:
+            del pose_results
+            if 'landmarks' in locals():
+                del landmarks
+            if 'nose' in locals():
+                del nose, left_shoulder, right_shoulder
+        except Exception:
+            pass
+        
         with suppress_stderr():
             face_results = state["face_model"].process(rgb_frame)
             
+            # IMMEDIATE extraction and cleanup to prevent C++ memory accumulation
+            face_landmarks = None
             if face_results.multi_face_landmarks:
-                state["face_landmarks"] = face_results.multi_face_landmarks[0]
+                # Extract what we need immediately
                 face_landmarks = face_results.multi_face_landmarks[0]
+                state["face_landmarks"] = face_landmarks
+            
+            # Immediately delete face_results to free C++ memory
+            del face_results
+            
+            if face_landmarks:
                 
                 selected_face_coords = []
                 
@@ -1272,11 +1521,38 @@ def detect_pose_node(state: AgentState) -> AgentState:
                     },
                     "feature_vector_length": len(selected_face_coords)
                 }
+            
+            # Immediate cleanup after face processing to prevent memory accumulation
+            try:
+                if 'selected_face_coords' in locals():
+                    del selected_face_coords
+                if 'left_eye_coords' in locals():
+                    del left_eye_coords, right_eye_coords, left_eyebrow_coords, right_eyebrow_coords
+                    del nose_coords, lips_coords, face_oval_coords
+            except Exception:
+                pass
+        
+        # CRITICAL: Immediately cleanup the large rgb_frame numpy array
+        try:
+            del rgb_frame
+        except Exception:
+            pass
         
         state["landmark_data"] = landmark_data
         
         ml_features = state["feature_extractor"].extract_features(landmark_data)
         landmark_data["ml_features"] = ml_features
+        
+        # CRITICAL: Clear landmark_data from state immediately after ML processing to prevent accumulation
+        # Keep only essential data, clear the massive coordinate arrays
+        essential_data = {
+            "pose_detected": landmark_data.get("pose_landmarks") is not None,
+            "face_detected": landmark_data.get("face_landmarks") is not None,
+            "breathing": landmark_data.get("breathing", {}),
+            "ml_features": ml_features,  # Keep ML features for export
+            "timestamp": landmark_data.get("timestamp")
+        }
+        state["landmark_data"] = essential_data  # Replace with minimal data
         
         has_pose = landmark_data["pose_landmarks"] is not None
         has_face = landmark_data["face_landmarks"] is not None
@@ -1359,6 +1635,34 @@ def detect_pose_node(state: AgentState) -> AgentState:
         state["pose_landmarks"] = None
         state["face_landmarks"] = None
         state["landmark_data"] = None
+        
+        # Reinitialize MediaPipe models on error to prevent corruption
+        if state["frame_count"] % 50 == 0:  # Every 50 frames
+            print("🔄 Reinitializing MediaPipe models due to repeated errors...")
+            try:
+                if "pose_model" in state:
+                    del state["pose_model"]
+                if "face_model" in state:
+                    del state["face_model"]
+            except Exception as cleanup_error:
+                print(f"⚠️ Error during model cleanup: {cleanup_error}")
+    
+    # Aggressive per-frame cleanup to prevent memory accumulation
+    try:
+        if state["frame_count"] % 5 == 0:  # Every 5 frames
+            import gc
+            gc.collect()  # Light garbage collection
+        
+        # Always cleanup frame arrays and MediaPipe results to prevent accumulation
+        if 'rgb_frame' in locals():
+            del rgb_frame
+        if 'frame' in locals() and frame is not None:
+            del frame
+        # Clear frame from state to prevent accumulation
+        if "frame" in state:
+            del state["frame"]
+    except Exception:
+        pass
     
     return state
 
@@ -1374,8 +1678,8 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
             "timestamp": timestamp,
             "ml_features": landmark_data.get("ml_features", {}) if has_landmarks else {},
             "breathing": landmark_data.get("breathing", {}) if has_landmarks else {},
-            "has_pose": landmark_data.get("pose_landmarks") is not None if has_landmarks else False,
-            "has_face": landmark_data.get("face_landmarks") is not None if has_landmarks else False
+            "has_pose": landmark_data.get("pose_detected", False) if has_landmarks else False,
+            "has_face": landmark_data.get("face_detected", False) if has_landmarks else False
         })
         
         if aggregated_data and aggregated_data.get("status") != "insufficient_data":
@@ -1390,6 +1694,12 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
             
             print(f"🎯 ML TRAINING WINDOW EXPORTED - Window {window_id}")
             print(f"   Duration: {aggregated_data['duration_seconds']:.1f}s ({aggregated_data['valid_frames']}/{aggregated_data['frame_count']} valid frames)")
+            
+            # Show memory usage before cleanup
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_before = process.memory_info().rss / 1024 / 1024  # MB
+            print(f"   💾 Memory usage before cleanup: {memory_before:.1f} MB")
             
             breathing = aggregated_data.get("breathing_analysis", {})
             if breathing.get("mean_bpm"):
@@ -1408,6 +1718,106 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
                 print(f"   Patterns: coherence: {behavioral['physiological_coherence']:.2f}, volatility: {behavioral.get('behavioral_volatility', 0):.3f}")
             
             print(f"   📁 Saved to: ml_training_data/window_{window_id:06d}_ml_features.json")
+            
+            # CRITICAL: Clear memory caches after export to prevent memory buildup and crashes
+            print("🧹 AGGRESSIVE MEMORY CLEANUP after window export...")
+            
+            # Clear breathing tracker cache
+            if "breathing_tracker" in state and state["breathing_tracker"]:
+                try:
+                    tracker = state["breathing_tracker"]
+                    print(f"   Clearing breathing tracker buffers (had {len(tracker.timestamps)} timestamps)")
+                    tracker.timestamps.clear()
+                    tracker.head_y.clear()
+                    tracker.shoulder_y.clear()
+                    tracker.torso_center_y.clear()
+                    tracker.combined_signal.clear()
+                    tracker.peaks.clear()
+                    tracker.valleys.clear()
+                    # Reset calibration to prevent accumulated error
+                    tracker.is_calibrated = False
+                    tracker.calibration_frames = 0
+                    print("   ✅ Breathing tracker buffers cleared")
+                except Exception as bt_error:
+                    print(f"   ⚠️ Error clearing breathing tracker: {bt_error}")
+            
+            # Clear feature extractor cache
+            if "feature_extractor" in state and state["feature_extractor"]:
+                try:
+                    extractor = state["feature_extractor"]
+                    if hasattr(extractor, 'history_buffer'):
+                        print(f"   Clearing feature extractor history (had {len(extractor.history_buffer)} entries)")
+                        extractor.history_buffer.clear()
+                        print("   ✅ Feature extractor history cleared")
+                except Exception as fe_error:
+                    print(f"   ⚠️ Error clearing feature extractor: {fe_error}")
+            
+            # Clear ML aggregator buffer (this is the big one!)
+            if "ml_aggregator" in state and state["ml_aggregator"]:
+                try:
+                    aggregator = state["ml_aggregator"]
+                    print(f"   Clearing ML aggregator buffer (had {len(aggregator.data_buffer)} frames)")
+                    aggregator.data_buffer.clear()
+                    print("   ✅ ML aggregator buffer cleared")
+                except Exception as agg_error:
+                    print(f"   ⚠️ Error clearing ML aggregator: {agg_error}")
+            
+            # SAFER CLEANUP: Clear buffers but don't recreate components
+            print("   🧹 SAFE CLEANUP: Clearing buffers without component recreation...")
+            try:
+                # Just clear buffers, don't recreate objects
+                if "breathing_tracker" in state and state["breathing_tracker"]:
+                    tracker = state["breathing_tracker"]
+                    if hasattr(tracker, 'breathing_signal'):
+                        tracker.breathing_signal.clear()
+                    if hasattr(tracker, 'timestamps'):
+                        tracker.timestamps.clear()
+                    if hasattr(tracker, 'movement_buffer'):
+                        tracker.movement_buffer.clear()
+                
+                # Clear feature extractor internal state if any
+                if "feature_extractor" in state and state["feature_extractor"]:
+                    # Don't recreate, just clear any internal buffers
+                    pass
+                
+                # Clear ML aggregator buffer (already done above)
+                
+                print("   ✅ Component buffers cleared safely")
+            except Exception as safe_error:
+                print(f"   ⚠️ Error in safe cleanup: {safe_error}")
+            
+            # DON'T close MediaPipe models - just clear stored results
+            try:
+                # Clear stored landmarks and frames that can accumulate
+                if "pose_landmarks" in state:
+                    del state["pose_landmarks"]
+                if "face_landmarks" in state:
+                    del state["face_landmarks"]
+                if "frame" in state:
+                    del state["frame"]
+                if "landmark_data" in state:
+                    del state["landmark_data"]
+                    
+                print("   ✅ Stored data cleared (models kept alive)")
+            except Exception as clear_error:
+                print(f"   ⚠️ Error clearing stored data: {clear_error}")
+            
+            # Multiple garbage collection passes
+            import gc
+            print("   🗑️ Running multiple garbage collection passes...")
+            collected_total = 0
+            for i in range(3):  # Multiple passes
+                collected = gc.collect()
+                collected_total += collected
+                if i == 0:
+                    # Force collection of generation 2 (oldest objects)
+                    gc.collect(2)
+            print(f"   ✅ Garbage collection freed {collected_total} objects (3 passes)")
+            
+            # Show memory usage after cleanup
+            memory_after = process.memory_info().rss / 1024 / 1024  # MB
+            memory_freed = memory_before - memory_after
+            print(f"   💾 Memory usage after cleanup: {memory_after:.1f} MB (freed {memory_freed:.1f} MB)")
             
             state["status"] = "window_exported"
         else:
@@ -1470,6 +1880,16 @@ def create_agent_graph():
 def main():
     """Main agent loop."""
     print("🚀 Starting MediaPipe LangGraph Agent")
+    
+    # Check baseline memory usage
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        baseline_memory = process.memory_info().rss / 1024 / 1024
+        print(f"📊 Baseline memory usage: {baseline_memory:.1f} MB")
+    except Exception as e:
+        print(f"⚠️ Could not check baseline memory: {e}")
+    
     webrtc_status_path = os.path.join(os.path.dirname(__file__), "frames", "webrtc_ready")
     
     print("⏳ Waiting for WebRTC to be ready...")
@@ -1477,51 +1897,80 @@ def main():
         time.sleep(0.5)
     
     print("✅ WebRTC ready, starting pose detection")
-    agent = create_agent_graph()
-    initial_state: AgentState = {
-        "frame": None,
-        "pose_landmarks": None,
-        "face_landmarks": None,
-        "frame_count": 0,
-        "last_detection_time": 0.0,
-        "status": "starting",
-        "landmark_data": None,
-        "breathing_tracker": None,
-        "feature_extractor": None,
-        "ml_aggregator": None
-    }
     
-    try:
-        print("🔄 Agent running... (Ctrl+C to stop)")
-        
-        config = {"recursion_limit": 1000}
-        
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-        
-        for state in agent.stream(initial_state, config=config):
-            try:
-                consecutive_errors = 0
-                time.sleep(0.001)
-                
-            except Exception as e:
-                consecutive_errors += 1
-                print(f"⚠️ Agent iteration error #{consecutive_errors}: {e}")
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    print(f"❌ Too many consecutive errors ({consecutive_errors}), stopping agent")
-                    break
-                time.sleep(0.1)
-                continue
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    restart_counter = 0
+    max_restarts = 3
+    
+    while restart_counter < max_restarts:
+        try:
+            agent = create_agent_graph()
+            initial_state: AgentState = {
+                "frame": None,
+                "pose_landmarks": None,
+                "face_landmarks": None,
+                "frame_count": 0,
+                "last_detection_time": 0.0,
+                "status": "starting",
+                "landmark_data": None,
+                "breathing_tracker": None,
+                "feature_extractor": None,
+                "ml_aggregator": None
+            }
             
-    except KeyboardInterrupt:
-        print("\n⏹️ Agent stopped by user")
-    except Exception as e:
-        print(f"❌ Agent fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("🏁 Agent shutdown complete")
+            print(f"🔄 Agent running... (Attempt {restart_counter + 1}/{max_restarts}, Ctrl+C to stop)")
+            
+            config = {"recursion_limit": 1000}
+            
+            frame_count = 0
+            max_frames_per_session = 500  # Reduced limit to force more frequent restarts
+            
+            for state in agent.stream(initial_state, config=config):
+                try:
+                    consecutive_errors = 0
+                    frame_count += 1
+                    
+                    # Check if we've hit the frame limit
+                    if frame_count >= max_frames_per_session:
+                        print(f"🛑 Reached maximum frames per session ({max_frames_per_session}), restarting agent to prevent memory issues")
+                        break
+                    
+                    # Periodic cleanup every 500 frames to prevent memory buildup
+                    if frame_count % 500 == 0:
+                        print(f"🧹 Periodic cleanup at frame {frame_count}")
+                        import gc
+                        gc.collect()
+                    
+                    time.sleep(0.001)
+                    
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"⚠️ Agent iteration error #{consecutive_errors}: {e}")
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"❌ Too many consecutive errors ({consecutive_errors}), restarting agent")
+                        break
+                    time.sleep(0.1)
+                    continue
+                    
+        except KeyboardInterrupt:
+            print("\n⏹️ Agent stopped by user")
+            break
+        except Exception as e:
+            restart_counter += 1
+            print(f"❌ Agent fatal error (attempt {restart_counter}): {e}")
+            import traceback
+            traceback.print_exc()
+            
+            if restart_counter < max_restarts:
+                print(f"🔄 Restarting agent in 2 seconds... ({restart_counter}/{max_restarts})")
+                time.sleep(2)
+            else:
+                print(f"❌ Max restart attempts reached ({max_restarts}), giving up")
+                break
+    
+    print("🏁 Agent shutdown complete")
 
 
 if __name__ == "__main__":

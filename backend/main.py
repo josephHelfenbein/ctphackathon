@@ -29,6 +29,10 @@ outbox: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 tcs: Set[RTCPeerConnection] = set()
 webrtc_ready = threading.Event()
 
+# Buffer candidates until peer connection is ready
+pending_candidates: list = []
+connection_ready = False
+
 os.makedirs("frames", exist_ok=True)
 latest_frame_path = os.path.join("frames", "latest_frame.jpg")
 webrtc_status_path = os.path.join("frames", "webrtc_ready")
@@ -85,10 +89,24 @@ async def handle_offer(payload: Dict[str, Any], ws: WebSocketServerProtocol) -> 
                         frame_count += 1
                         
                         img = frame.to_ndarray(format="bgr24")
-                        await asyncio.to_thread(cv2.imwrite, latest_frame_path, img)
+                        
+                        # Atomic write: write to temp file first, then rename
+                        temp_path = latest_frame_path + ".tmp"
+                        success = await asyncio.to_thread(cv2.imwrite, temp_path, img)
+                        
+                        if success:
+                            # Atomic rename to avoid partial reads
+                            await asyncio.to_thread(os.rename, temp_path, latest_frame_path)
+                        else:
+                            print(f"⚠️ Failed to write frame #{frame_count}")
+                            # Clean up temp file if write failed
+                            try:
+                                await asyncio.to_thread(os.remove, temp_path)
+                            except:
+                                pass
                         
                         if frame_count % 100 == 1:
-                            print(f"� Frame #{frame_count} saved ({img.shape})")
+                            print(f"📸 Frame #{frame_count} saved ({img.shape})")
                         
                     except Exception as e:
                         print(f"⚠️ Failed to process frame #{frame_count}: {e}")
@@ -115,51 +133,163 @@ async def handle_offer(payload: Dict[str, Any], ws: WebSocketServerProtocol) -> 
         "type": pc.localDescription.type,
     })))
     print("📤 Sent WebRTC answer to client")
+    
+    # Mark connection as ready and process any buffered candidates
+    global connection_ready, pending_candidates
+    connection_ready = True
+    print(f"🔗 Connection ready! Processing {len(pending_candidates)} buffered candidates...")
+    
+    # Process any candidates that arrived while we were setting up
+    for buffered_payload in pending_candidates:
+        try:
+            await handle_candidate_internal(buffered_payload)
+        except Exception as e:
+            print(f"⚠️ Error processing buffered candidate: {e}")
+    
+    pending_candidates.clear()
+    print("✅ All buffered candidates processed")
 
 
 async def handle_candidate(payload: Dict[str, Any]) -> None:
+    """Main candidate handler that buffers candidates if connection isn't ready"""
+    global connection_ready, pending_candidates
+    
+    if not connection_ready:
+        print(f"📦 Buffering ICE candidate (total buffered: {len(pending_candidates) + 1})")
+        pending_candidates.append(payload)
+        return
+    
+    await handle_candidate_internal(payload)
+
+
+async def handle_candidate_internal(payload: Dict[str, Any]) -> None:
+    """Internal candidate handler that processes candidates immediately"""
     candidate_str = payload.get("candidate")
     sdp_mid = payload.get("sdpMid")
     sdp_mline_index = payload.get("sdpMLineIndex")
     
     if not candidate_str:
-        print("⚠️ No candidate string provided")
+        print("⚠️ No candidate string provided - this is normal during ICE gathering")
+        return  # Don't treat this as an error
+    
+    # Handle empty candidate (end-of-candidates indicator)
+    if candidate_str.strip() == "":
+        print("ℹ️ End-of-candidates indicator received")
         return
     
-    try:
-        parts = candidate_str.split()
-        if len(parts) < 8 or not parts[0].startswith("candidate:"):
-            print(f"⚠️ Invalid candidate format: {candidate_str}")
-            return
+    # Add initial delay for very early candidates to allow connection setup
+    if len(tcs) == 0:
+        print("⏳ Waiting for peer connection to be established...")
+        await asyncio.sleep(1.0)  # Give connection time to establish
+    
+    max_retries = 3
+    retry_count = 0
+    base_delay = 0.5  # Start with 500ms delay
+    
+    while retry_count < max_retries:
+        try:
+            retry_count += 1
             
-        foundation = parts[0][10:]
-        component = int(parts[1])
-        protocol = parts[2].lower()
-        priority = int(parts[3])
-        ip = parts[4]
-        port = int(parts[5])
-        typ = parts[6]
-        candidate_type = parts[7]
-        cand = RTCIceCandidate(
-            component=component,
-            foundation=foundation,
-            ip=ip,
-            port=port,
-            priority=priority,
-            protocol=protocol,
-            type=candidate_type,
-            sdpMid=sdp_mid,
-            sdpMLineIndex=sdp_mline_index
-        )
-        
-        for pc in list(tcs):
-            try:
-                await pc.addIceCandidate(cand)
-            except Exception as e:
-                print(f"ICE add failed on pc {id(pc)}: {e}")
+            # Wait longer if peer connections aren't ready yet
+            if len(tcs) == 0:
+                wait_time = base_delay * retry_count * 2  # Progressive delay: 1s, 2s, 4s
+                print(f"⏳ No peer connections available, waiting {wait_time}s before retry {retry_count}")
+                await asyncio.sleep(wait_time)
                 
-    except (ValueError, IndexError) as e:
-        print(f"⚠️ Failed to parse candidate '{candidate_str}': {e}")
+            # Check if we have active connections
+            if len(tcs) == 0:
+                print(f"⚠️ No peer connections available for ICE candidate (attempt {retry_count})")
+                if retry_count < max_retries:
+                    continue
+                else:
+                    print("❌ No peer connections established after all retries")
+                    return
+            parts = candidate_str.split()
+            if len(parts) < 8 or not parts[0].startswith("candidate:"):
+                print(f"⚠️ Invalid candidate format (attempt {retry_count}): {candidate_str}")
+                if retry_count < max_retries:
+                    await asyncio.sleep(0.1)  # Brief delay before retry
+                    continue
+                else:
+                    return
+                
+            foundation = parts[0][10:]
+            component = int(parts[1])
+            protocol = parts[2].lower()
+            priority = int(parts[3])
+            ip = parts[4]
+            port = int(parts[5])
+            typ = parts[6]
+            candidate_type = parts[7]
+            cand = RTCIceCandidate(
+                component=component,
+                foundation=foundation,
+                ip=ip,
+                port=port,
+                priority=priority,
+                protocol=protocol,
+                type=candidate_type,
+                sdpMid=sdp_mid,
+                sdpMLineIndex=sdp_mline_index
+            )
+            
+            # Try to add candidate to all active peer connections
+            successful_adds = 0
+            total_connections = len(tcs)
+            print(f"🔍 Attempting to add ICE candidate to {total_connections} peer connection(s)")
+            
+            for i, pc in enumerate(list(tcs)):
+                try:
+                    connection_state = getattr(pc, 'connectionState', 'unknown')
+                    ice_state = getattr(pc, 'iceConnectionState', 'unknown')
+                    print(f"   PC #{i}: connectionState={connection_state}, iceConnectionState={ice_state}")
+                    
+                    await pc.addIceCandidate(cand)
+                    successful_adds += 1
+                    print(f"   ✅ ICE candidate added to PC #{i}")
+                except Exception as e:
+                    print(f"   ❌ ICE add failed on PC #{i}: {e}")
+                    
+            print(f"📊 ICE candidate results: {successful_adds}/{total_connections} successful")
+            
+            if successful_adds == 0 and total_connections > 0:
+                print("⚠️ No peer connections accepted the ICE candidate")
+            elif successful_adds < total_connections:
+                print(f"⚠️ Some peer connections ({total_connections - successful_adds}) rejected the ICE candidate")
+            else:
+                print("✅ All peer connections accepted the ICE candidate")
+                
+            if successful_adds > 0:
+                print(f"✅ ICE candidate added successfully to {successful_adds} connection(s)")
+                break
+            else:
+                wait_time = base_delay * retry_count  # Progressive delay: 0.5s, 1s, 1.5s
+                print(f"⚠️ Failed to add ICE candidate to any connections (attempt {retry_count})")
+                if retry_count < max_retries:
+                    print(f"⏳ Waiting {wait_time}s before retry...")
+                    await asyncio.sleep(wait_time)
+                    
+        except (ValueError, IndexError) as e:
+            wait_time = base_delay * retry_count
+            print(f"⚠️ Failed to parse candidate '{candidate_str}' (attempt {retry_count}): {e}")
+            if retry_count < max_retries:
+                print(f"⏳ Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                break
+        except Exception as e:
+            wait_time = base_delay * retry_count
+            print(f"⚠️ Unexpected error handling candidate (attempt {retry_count}): {e}")
+            if retry_count < max_retries:
+                print(f"⏳ Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                break
+    
+    if retry_count >= max_retries:
+        print(f"❌ Failed to handle ICE candidate after {max_retries} attempts")
 
 
 async def webrtc_capture_frame() -> Dict[str, Any]:
@@ -237,8 +367,22 @@ def start_agent(_data: Optional[Dict[str, Any]] = None) -> None:
         except Exception:
             pass
         proc.wait()
-        print(f"⚠️ Agent exited ({proc.returncode})")
-        send_log("new_log", f"⚠️ Agent exited ({proc.returncode})")
+        exit_code = proc.returncode
+        print(f"⚠️ Agent exited ({exit_code})")
+        send_log("new_log", f"⚠️ Agent exited ({exit_code})")
+        
+        # Auto-restart agent if it crashes (but not if manually stopped)
+        if exit_code != 0 and exit_code != -2:  # -2 is SIGINT (Ctrl+C)
+            print("🔄 Agent crashed, will auto-restart in 3 seconds...")
+            import time
+            time.sleep(3)
+            
+            # Clear the agent_thread to allow restart
+            agent_thread = None
+            
+            # Restart the agent
+            print("🔄 Auto-restarting agent...")
+            start_agent(_data)
 
     agent_thread = threading.Thread(target=_run, daemon=True)
     agent_thread.start()
@@ -248,27 +392,55 @@ def start_agent(_data: Optional[Dict[str, Any]] = None) -> None:
 async def ws_handler(ws: WebSocketServerProtocol):
     clients.add(ws)
     print(f"🔗 Client connected: {ws.remote_address}")
+    connection_errors = 0
+    max_connection_errors = 5
+    
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-            except Exception:
-                print(f"🔸 Non-JSON message: {raw}")
+                connection_errors = 0  # Reset error count on successful message
+            except json.JSONDecodeError as e:
+                connection_errors += 1
+                print(f"🔸 JSON decode error (#{connection_errors}): {e} - Raw: {raw}")
+                if connection_errors >= max_connection_errors:
+                    print(f"❌ Too many JSON errors ({connection_errors}), disconnecting client")
+                    break
+                continue
+            except Exception as e:
+                connection_errors += 1
+                print(f"🔸 Message processing error (#{connection_errors}): {e}")
+                if connection_errors >= max_connection_errors:
+                    print(f"❌ Too many connection errors ({connection_errors}), disconnecting client")
+                    break
                 continue
 
             msg_type = msg.get("type")
             payload = msg.get("payload") or {}
-
-            if msg_type == "ping":
-                await ws.send(json.dumps(_msg("pong", {"ts": payload.get("ts")})))
-            elif msg_type == "control.start":
-                start_agent(payload)
-            elif msg_type == "webrtc.offer":
-                asyncio.create_task(handle_offer(payload, ws))
-            elif msg_type == "webrtc.candidate":
-                asyncio.create_task(handle_candidate(payload))
+            
+            print(f"📥 Received: {msg_type}")
+            if payload and len(str(payload)) > 100:
+                print(f"    Payload preview: {str(payload)[:100]}...")
             else:
-                print(f"ℹ️ Unhandled msg: {msg_type}")
+                print(f"    Payload: {payload}")
+
+            try:
+                if msg_type == "ping":
+                    await ws.send(json.dumps(_msg("pong", {"ts": payload.get("ts")})))
+                elif msg_type == "control.start":
+                    start_agent(payload)
+                elif msg_type == "webrtc.offer":
+                    asyncio.create_task(handle_offer(payload, ws))
+                elif msg_type == "webrtc.candidate":
+                    asyncio.create_task(handle_candidate(payload))
+                else:
+                    print(f"ℹ️ Unhandled msg: {msg_type}")
+            except Exception as handler_error:
+                print(f"⚠️ Error handling message type '{msg_type}': {handler_error}")
+                # Don't disconnect for handler errors, just log and continue
+                
+    except Exception as ws_error:
+        print(f"⚠️ WebSocket connection error: {ws_error}")
     finally:
         clients.discard(ws)
         print(f"🔗 Client disconnected: {ws.remote_address}")

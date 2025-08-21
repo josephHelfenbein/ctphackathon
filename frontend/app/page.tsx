@@ -85,8 +85,30 @@ export default function StressDashboard() {
       wsRef.current = ws;
       setAgentStatus("ws-connecting");
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         setAgentStatus("ws-open");
+        
+        // Setup WebRTC after WebSocket is open
+        const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+        pcRef.current = pc;
+        cameraStream.getTracks().forEach((t) => pc.addTrack(t, cameraStream));
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
+            const msg: WsMsg = { type: "webrtc.candidate", payload: ev.candidate.toJSON() };
+            wsRef.current.send(JSON.stringify(msg));
+          }
+        };
+
+        // Create and send offer after WebSocket is ready
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const offerMsg: WsMsg = { type: "webrtc.offer", payload: offer };
+        ws.send(JSON.stringify(offerMsg));
+        console.log("📤 Sent WebRTC offer to server");
+        
+        // Start the agent
+        ws.send(JSON.stringify({ type: "control.start", payload: {} } satisfies WsMsg));
       };
 
       ws.onmessage = async (e) => {
@@ -122,24 +144,6 @@ export default function StressDashboard() {
         setAgentStatus("ws-error");
         setIsMonitoring(false);
       };
-
-      // Use existing camera stream for WebRTC
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-      pcRef.current = pc;
-      cameraStream.getTracks().forEach((t) => pc.addTrack(t, cameraStream));
-
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
-          const msg: WsMsg = { type: "webrtc.candidate", payload: ev.candidate.toJSON() };
-          wsRef.current.send(JSON.stringify(msg));
-        }
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const offerMsg: WsMsg = { type: "webrtc.offer", payload: offer };
-      ws.send(JSON.stringify(offerMsg));
-      ws.send(JSON.stringify({ type: "control.start", payload: {} } satisfies WsMsg));
 
     } catch (err: any) {
       console.error("Agent connection error:", err);
