@@ -107,6 +107,7 @@ Goal: Collect windows with `agent.py`, label via protocol segments, train a mode
 1. Start recording: note epoch start time (run `date +%s` right when session begins).
 2. Run the agent (produces window JSON files in `backend/ml_training_data/`).
 3. Generate segments file matching your protocol:
+
 ```
 python backend/generate_segments.py \
 	--subject S01 --session SES01 \
@@ -114,17 +115,22 @@ python backend/generate_segments.py \
 	--phases baseline:calm:120 task:stressed:180 recovery:calm:120 \
 	--out data/segments.csv
 ```
+
 4. Ingest & label windows:
+
 ```
 python backend/ingest_label_windows.py \
 	--segments-file data/segments.csv \
 	--windows-dir backend/ml_training_data \
 	--out-file data/dataset.parquet
 ```
+
 5. Train model:
+
 ```
 python backend/train_stress_model.py --data-file data/dataset.parquet --out-dir backend/models
 ```
+
 6. (Later) Add self-reports and re-run ingestion for refined labels.
 
 Now you have: labeled dataset + saved model + feature metadata. Integrate inference next.
