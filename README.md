@@ -12,7 +12,7 @@ Stress, anxiety, and other emotions can be detrimental to people's health and we
 
 ## What It Does
 
-Dev Agent is an AI Agent that estimates stress and mindfulness based on facial and audio indicators. It is trained on an ML model to provide assistance such as:
+Zen Agent is an AI Agent that estimates stress and mindfulness based on facial and audio indicators. It is trained on an ML model to provide assistance such as:
 
 - Providing notifications during virtual meetings to check your emotions
 - Suggesting a quick relaxation exercise to reduce stress and anxiety
@@ -20,7 +20,7 @@ Dev Agent is an AI Agent that estimates stress and mindfulness based on facial a
 
 ## How We Built It
 
-Dev Agent was developed using the following tools and technologies:
+Zen Agent was developed using the following tools and technologies:
 
 - TypeScript
 - Python
@@ -51,7 +51,7 @@ Dev Agent was developed using the following tools and technologies:
 - The challenges encountered in processing live video in applications for a smooth, responsive user experience.
 - How agentic AI can be utilized in innovative ways, such as a tool to promote better well-being and mindfulness.
     
-## Future Enhancements For Dev Agent
+## Future Enhancements For Zen Agent
 
 - Developing mobile apps on iOS and Android to expand access to the Agent to more users.
 - Creating a system where users can provide feedback and suggestions to improve the application.
