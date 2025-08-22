@@ -1861,18 +1861,17 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
         })
         
         if aggregated_data and aggregated_data.get("status") != "insufficient_data":
-            landmarks_dir = os.path.join(os.path.dirname(__file__), "ml_training_data")
-            os.makedirs(landmarks_dir, exist_ok=True)
-            
-            window_id = aggregated_data["window_id"]
-            export_file = os.path.join(landmarks_dir, f"window_{window_id:06d}_ml_features.json")
-            
-            with open(export_file, 'w') as f:
-                json.dump(aggregated_data, f, indent=2)
-            
-            print(f"🎯 ML TRAINING WINDOW EXPORTED - Window {window_id}")
-            print(f"   Duration: {aggregated_data['duration_seconds']:.1f}s ({aggregated_data['valid_frames']}/{aggregated_data['frame_count']} valid frames)")
-            
+            # Emit the full window JSON inline (single line) for live prediction
+            try:
+                print(json.dumps(aggregated_data, separators=(",", ":")))
+            except Exception as emit_err:
+                print(f"❌ Failed to emit window JSON: {emit_err}")
+
+            # Human-readable summary for logs
+            window_id = aggregated_data.get("window_id")
+            print(f"🎯 ML TRAINING WINDOW READY - Window {window_id}")
+            print(f"   Duration: {aggregated_data.get('duration_seconds', 0):.1f}s ({aggregated_data.get('valid_frames', 0)}/{aggregated_data.get('frame_count', 0)} valid frames)")
+
             # Show memory usage before cleanup
             import psutil
             process = psutil.Process(os.getpid())
@@ -1895,7 +1894,7 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
             if behavioral.get("physiological_coherence"):
                 print(f"   Patterns: coherence: {behavioral['physiological_coherence']:.2f}, volatility: {behavioral.get('behavioral_volatility', 0):.3f}")
             
-            print(f"   📁 Saved to: ml_training_data/window_{window_id:06d}_ml_features.json")
+            # No file saved; using inline JSON for live predictions
             
             # CRITICAL: Post-export memory hygiene without losing signal/baselines
             print("🧹 Post-export cleanup (buffers only, keep calibrations and baselines)")

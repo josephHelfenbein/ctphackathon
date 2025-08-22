@@ -7,6 +7,7 @@ import threading
 import time
 import subprocess
 from typing import Any, Dict, Optional, Set
+from asyncio import AbstractEventLoop
 
 import cv2
 import av
@@ -15,6 +16,9 @@ from websockets.server import WebSocketServerProtocol
 
 from dotenv import load_dotenv
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+from joblib import load
+import numpy as np
+import re
 
 av.logging.set_level(av.logging.ERROR)
 
@@ -22,6 +26,56 @@ load_dotenv()
 
 
 WS_PORT = int(os.getenv("WS_PORT", "8765"))
+
+# Load the stress model once
+def load_stress_model():
+    try:
+        model_path = os.path.join(os.path.dirname(__file__), 'models', 'stress_rf.joblib')
+        meta_path = os.path.join(os.path.dirname(__file__), 'models', 'model_metadata.json')
+        # Load model and metadata
+        model = load(model_path)
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+        # Extract features from metadata
+        features = metadata.get('features', [])
+        medians = metadata.get('medians', {})
+        return model, features, medians
+    except Exception as e:
+        print(f"❌ Error loading stress model: {e}")
+        return None, None, None
+
+STRESS_MODEL, FEATURE_LIST, FEATURE_MEDIANS = load_stress_model()
+
+def preprocess_window(window_data):
+    if not FEATURE_LIST or not FEATURE_MEDIANS:
+        return None
+    
+    # Flatten the window data similar to ingest_label_windows
+    def flatten_dict(d, prefix=''):
+        flat = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                flat.update(flatten_dict(v, prefix=f"{prefix}{k}."))
+            else:
+                flat[f"{prefix}{k}"] = v
+        return flat
+    
+    flat_data = flatten_dict(window_data)
+    
+    # Select and preprocess features
+    features_subset = []
+    for feat in FEATURE_LIST:
+        value = flat_data.get(feat, np.nan)
+        if value is None:
+            value = np.nan
+        features_subset.append(value)
+    
+    # Replace NaNs with stored medians from training
+    for i, feat in enumerate(FEATURE_LIST):
+        if np.isnan(features_subset[i]):
+            features_subset[i] = FEATURE_MEDIANS.get(feat, 0)
+    
+    return np.array(features_subset).reshape(1, -1)
 
 AGENT_CMD = os.getenv("AGENT_CMD")
 outbox: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
@@ -42,13 +96,43 @@ def _msg(msg_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
 
 clients: Set[WebSocketServerProtocol] = set()
+MAIN_LOOP: Optional[AbstractEventLoop] = None
+LAST_CLIENT_ID: Optional[str] = None
 
 def ws_send_sync(msg_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Thread-safe broadcast helper for payload-wrapped messages."""
+    global MAIN_LOOP
     msg = json.dumps(_msg(msg_type, payload))
-    for ws in clients:
+    targets = list(clients)
+    for ws in targets:
         try:
-            asyncio.get_event_loop().create_task(ws.send(msg))
+            if MAIN_LOOP is not None:
+                asyncio.run_coroutine_threadsafe(ws.send(msg), MAIN_LOOP)
+            else:
+                # Best-effort fallback if called from within the event loop
+                asyncio.get_running_loop().create_task(ws.send(msg))
         except Exception:
+            # Suppress to avoid crashing sender threads
+            pass
+
+def ws_broadcast_raw(message: Dict[str, Any]) -> None:
+    """Thread-safe broadcast of a pre-shaped JSON object to all clients."""
+    global MAIN_LOOP
+    try:
+        msg = json.dumps(message)
+    except Exception as e:
+        print(f"⚠️ Failed to encode message: {e}")
+        return
+    targets = list(clients)
+    for ws in targets:
+        try:
+            if MAIN_LOOP is not None:
+                asyncio.run_coroutine_threadsafe(ws.send(msg), MAIN_LOOP)
+            else:
+                # Best-effort fallback if called from within the event loop
+                asyncio.get_running_loop().create_task(ws.send(msg))
+        except Exception:
+            # Suppress to avoid crashing sender threads
             pass
 
 
@@ -350,6 +434,130 @@ def start_agent(_data: Optional[Dict[str, Any]] = None) -> None:
             line = raw.rstrip()
             print(f"[agent] {line}")
             try:
+                # Check for feature window JSON printed inline (not typical currently)
+                if line.startswith("{") and "window_id" in line:
+                    try:
+                        window_data = json.loads(line)
+                        if STRESS_MODEL is not None:
+                            processed_window = preprocess_window(window_data)
+                            if processed_window is not None:
+                                # Predict probabilities with fallbacks
+                                if hasattr(STRESS_MODEL, "predict_proba"):
+                                    probs = STRESS_MODEL.predict_proba(processed_window)[0]
+                                    p_stressed = float(probs[1]) if len(probs) > 1 else float(probs[0])
+                                elif hasattr(STRESS_MODEL, "decision_function"):
+                                    score = float(STRESS_MODEL.decision_function(processed_window)[0])
+                                    # Map decision score to [0,1]
+                                    p_stressed = 1.0 / (1.0 + np.exp(-score))
+                                else:
+                                    pred = int(STRESS_MODEL.predict(processed_window)[0])
+                                    p_stressed = float(pred)
+
+                                label = "stressed" if p_stressed >= 0.5 else "calm"
+                                confidence = p_stressed if label == "stressed" else (1.0 - p_stressed)
+                                
+                                # Derive auxiliary metrics when available
+                                breathing_rate = None
+                                blink_rate = None
+                                posture_stress = None
+                                try:
+                                    ba = window_data.get("breathing_analysis", {}) or {}
+                                    ea = window_data.get("eye_analysis", {}) or {}
+                                    pa = window_data.get("posture_analysis", {}) or {}
+                                    br = ba.get("mean_bpm")
+                                    if isinstance(br, (int, float)):
+                                        breathing_rate = float(br)
+                                    bl = ea.get("blink_frequency")
+                                    if isinstance(bl, (int, float)):
+                                        blink_rate = float(bl)
+                                    ps = pa.get("posture_stability")
+                                    if isinstance(ps, (int, float)):
+                                        # Map stability [0..1+] to stress [0..100]
+                                        posture_stress = float(max(0.0, min(100.0, (1.0 - float(ps)) * 100.0)))
+                                except Exception:
+                                    pass
+
+                                # Send prediction via websocket (top-level type + fields)
+                                msg = {
+                                    "type": "prediction",
+                                    "label": label,
+                                    "confidence": float(confidence),
+                                    "client_id": LAST_CLIENT_ID,
+                                    "timestamp": window_data.get("timestamp_start"),
+                                    "window_id": window_data.get("window_id"),
+                                }
+                                # Attach auxiliary metrics if present
+                                if breathing_rate is not None:
+                                    msg["breathing_rate"] = breathing_rate
+                                if blink_rate is not None:
+                                    msg["blink_rate"] = blink_rate
+                                if posture_stress is not None:
+                                    msg["posture_stress"] = posture_stress
+                                ws_broadcast_raw(msg)
+                    except Exception as pred_error:
+                        print(f"❌ Prediction error: {pred_error}")
+
+                # Detect saved JSON file path from agent and run prediction by loading file
+                if "Saved to: ml_training_data/window_" in line:
+                    try:
+                        m = re.search(r"Saved to: (ml_training_data\/window_\d+_ml_features\.json)", line)
+                        if m:
+                            json_path = os.path.join(os.path.dirname(__file__), m.group(1))
+                            with open(json_path, 'r') as jf:
+                                window_data = json.load(jf)
+                            if STRESS_MODEL is not None:
+                                processed_window = preprocess_window(window_data)
+                                if processed_window is not None:
+                                    if hasattr(STRESS_MODEL, "predict_proba"):
+                                        probs = STRESS_MODEL.predict_proba(processed_window)[0]
+                                        p_stressed = float(probs[1]) if len(probs) > 1 else float(probs[0])
+                                    elif hasattr(STRESS_MODEL, "decision_function"):
+                                        score = float(STRESS_MODEL.decision_function(processed_window)[0])
+                                        p_stressed = 1.0 / (1.0 + np.exp(-score))
+                                    else:
+                                        pred = int(STRESS_MODEL.predict(processed_window)[0])
+                                        p_stressed = float(pred)
+                                    label = "stressed" if p_stressed >= 0.5 else "calm"
+                                    confidence = p_stressed if label == "stressed" else (1.0 - p_stressed)
+                                    # Derive auxiliary metrics when available
+                                    breathing_rate = None
+                                    blink_rate = None
+                                    posture_stress = None
+                                    try:
+                                        ba = window_data.get("breathing_analysis", {}) or {}
+                                        ea = window_data.get("eye_analysis", {}) or {}
+                                        pa = window_data.get("posture_analysis", {}) or {}
+                                        br = ba.get("mean_bpm")
+                                        if isinstance(br, (int, float)):
+                                            breathing_rate = float(br)
+                                        bl = ea.get("blink_frequency")
+                                        if isinstance(bl, (int, float)):
+                                            blink_rate = float(bl)
+                                        ps = pa.get("posture_stability")
+                                        if isinstance(ps, (int, float)):
+                                            posture_stress = float(max(0.0, min(100.0, (1.0 - float(ps)) * 100.0)))
+                                    except Exception:
+                                        pass
+
+                                    msg = {
+                                        "type": "prediction",
+                                        "label": label,
+                                        "confidence": float(confidence),
+                                        "client_id": LAST_CLIENT_ID,
+                                        "timestamp": window_data.get("timestamp_start"),
+                                        "window_id": window_data.get("window_id"),
+                                    }
+                                    if breathing_rate is not None:
+                                        msg["breathing_rate"] = breathing_rate
+                                    if blink_rate is not None:
+                                        msg["blink_rate"] = blink_rate
+                                    if posture_stress is not None:
+                                        msg["posture_stress"] = posture_stress
+                                    ws_broadcast_raw(msg)
+                    except Exception as file_pred_err:
+                        print(f"❌ File-based prediction error: {file_pred_err}")
+
+                # Original log handling
                 if line.startswith("Starting") or line.startswith("Capturing") or line.startswith("✅ Body posture calibrated") or line.startswith("✅ Face angle calibrated") or line.startswith("❌"):
                     send_log("new_log", line)
                 elif line.startswith("⚠️ Bad posture detected!"):
@@ -392,6 +600,12 @@ def start_agent(_data: Optional[Dict[str, Any]] = None) -> None:
 async def ws_handler(ws: WebSocketServerProtocol):
     clients.add(ws)
     print(f"🔗 Client connected: {ws.remote_address}")
+    global LAST_CLIENT_ID
+    # Track a simple client_id for prediction routing
+    try:
+        LAST_CLIENT_ID = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
+    except Exception:
+        LAST_CLIENT_ID = "unknown"
     connection_errors = 0
     max_connection_errors = 5
     
@@ -428,6 +642,10 @@ async def ws_handler(ws: WebSocketServerProtocol):
                 if msg_type == "ping":
                     await ws.send(json.dumps(_msg("pong", {"ts": payload.get("ts")})))
                 elif msg_type == "control.start":
+                    # Optionally take provided client id
+                    cid = payload.get("client_id") or payload.get("clientId")
+                    if cid:
+                        LAST_CLIENT_ID = str(cid)
                     start_agent(payload)
                 elif msg_type == "webrtc.offer":
                     asyncio.create_task(handle_offer(payload, ws))
@@ -448,6 +666,8 @@ async def ws_handler(ws: WebSocketServerProtocol):
 
 
 async def ws_main() -> None:
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     print(f"🔌 WebSocket server listening on ws://0.0.0.0:{WS_PORT}")
     async with websockets.serve(ws_handler, "0.0.0.0", WS_PORT, max_size=4 * 1024 * 1024):
         await asyncio.Future()

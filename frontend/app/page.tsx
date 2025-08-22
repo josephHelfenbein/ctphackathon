@@ -21,8 +21,10 @@ type AgentStatus = "idle" | "fetching-ws-url" | "ws-connecting" | "ws-open" | "w
 const generateMockData = () => ({
   stressLevel: Math.random() * 100,
   breathingRate: 12 + Math.random() * 8,
-  confidenceLevel: 70 + Math.random() * 30,
-  heartRate: 60 + Math.random() * 40,
+  confidenceLevel: 70 + Math.random() * 30, // kept for gradient bar
+  blinkRate: 10 + Math.random() * 20, // blinks per minute
+  postureStress: Math.random() * 100, // 0-100%
+  heartRate: 60 + Math.random() * 40, // legacy (not shown)
 })
 
 export default function StressDashboard() {
@@ -30,6 +32,21 @@ export default function StressDashboard() {
   const [currentMetrics, setCurrentMetrics] = useState(generateMockData())
   const [cameraConnected, setCameraConnected] = useState(false)
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null)
+  const [lastPrediction, setLastPrediction] = useState<null | { label: string; confidence: number; window_id?: string; timestamp?: string }>(null)
+  // Stress alert notification state
+  const STRESS_ALERT_THRESHOLD = 0.85 // 85% confidence
+  const STRESS_ALERT_COOLDOWN_MS = 60_000 // 1 minute cooldown
+  const [alerts, setAlerts] = useState<Array<{ id: string; message: string }>>([])
+  const lastAlertRef = useRef<number>(0)
+  const alertedWindowsRef = useRef<Set<string>>(new Set())
+  const pushAlert = useCallback((message: string) => {
+    const id = Math.random().toString(36).slice(2)
+    setAlerts((prev) => [...prev, { id, message }])
+    // auto-dismiss after 6s
+    setTimeout(() => {
+      setAlerts((prev) => prev.filter((a) => a.id !== id))
+    }, 6000)
+  }, [])
   
   // Agent connection state
   const [agentStatus, setAgentStatus] = useState<AgentStatus>("idle")
@@ -125,12 +142,61 @@ export default function StressDashboard() {
           setRealTimeData(msg.payload);
           if (msg.payload) {
             // Update current metrics with real data
-            setCurrentMetrics({
-              stressLevel: msg.payload.stress_level || currentMetrics.stressLevel,
-              breathingRate: msg.payload.breathing_rate || currentMetrics.breathingRate,
-              confidenceLevel: msg.payload.confidence || currentMetrics.confidenceLevel,
-              heartRate: msg.payload.heart_rate || currentMetrics.heartRate,
+            setCurrentMetrics((prev) => ({
+              ...prev,
+              stressLevel: msg.payload.stress_level ?? prev.stressLevel,
+              breathingRate: msg.payload.breathing_rate ?? prev.breathingRate,
+              confidenceLevel: msg.payload.confidence ?? prev.confidenceLevel,
+              blinkRate: msg.payload.blink_rate ?? prev.blinkRate,
+              postureStress: msg.payload.posture_stress ?? prev.postureStress,
+              heartRate: msg.payload.heart_rate ?? prev.heartRate,
+            }));
+          }
+        } else if (msg.type === "prediction") {
+          // Backend sends top-level fields: { type: 'prediction', label, confidence, ... }
+          const pm: any = msg as any;
+          console.debug("prediction msg", pm);
+          const label: string | undefined = pm.label;
+          let conf: number | undefined = pm.confidence;
+          if (typeof conf !== "number") {
+            const parsed = Number(conf);
+            conf = isNaN(parsed) ? undefined : parsed;
+          }
+          if (conf !== undefined) {
+            const prob = conf > 1 ? conf / 100 : conf; // normalize if already percent
+            // Only label as stressed if >=70% confidence
+            const isConfidentStressed = label === "stressed" && prob >= 0.7;
+            const stressPct = isConfidentStressed ? prob * 100 : (1 - prob) * 100;
+            const breathingRate = typeof pm.breathing_rate === "number" ? pm.breathing_rate : currentMetrics.breathingRate;
+            const blinkRate = typeof pm.blink_rate === "number" ? pm.blink_rate : currentMetrics.blinkRate;
+            const postureStress = typeof pm.posture_stress === "number" ? pm.posture_stress : currentMetrics.postureStress;
+            setCurrentMetrics((prev) => ({
+              ...prev,
+              stressLevel: Math.max(0, Math.min(100, stressPct)),
+              confidenceLevel: Math.max(0, Math.min(100, prob * 100)),
+              breathingRate,
+              blinkRate,
+              postureStress,
+            }));
+            setLastPrediction({
+              label: isConfidentStressed ? "stressed" : "calm",
+              confidence: prob,
+              window_id: pm.window_id,
+              timestamp: pm.timestamp,
             });
+            setRealTimeData(pm);
+
+            // Trigger stress alert if high-confidence stressed and cooldown passed
+            const now = Date.now();
+            const windowId: string | undefined = pm.window_id;
+            const isHighStress = (isConfidentStressed && prob >= STRESS_ALERT_THRESHOLD) || (label === undefined && prob >= STRESS_ALERT_THRESHOLD);
+            const cooledDown = now - lastAlertRef.current > STRESS_ALERT_COOLDOWN_MS;
+            const notSeenWindow = windowId ? !alertedWindowsRef.current.has(windowId) : true;
+            if (isHighStress && cooledDown && notSeenWindow) {
+              pushAlert("High stress detected. Pause, breathe slowly, and take a short break.");
+              lastAlertRef.current = now;
+              if (windowId) alertedWindowsRef.current.add(windowId);
+            }
           }
         }
       };
@@ -352,6 +418,29 @@ export default function StressDashboard() {
 
 
       <div className="min-h-screen bg-background p-10 space-y-6">
+        {/* Bottom-right Toasts */}
+        <div className="fixed bottom-4 right-4 z-[60] flex flex-col gap-2 w-[320px] max-w-[90vw]">
+          {alerts.map((a) => (
+            <div
+              key={a.id}
+              className="bg-white border border-red-200 shadow-lg rounded-lg p-3 flex items-start gap-3 animate-in fade-in slide-in-from-bottom-2 duration-300"
+              role="alert"
+            >
+              <div className="h-2 w-2 mt-1 rounded-full bg-red-500 flex-shrink-0" />
+              <div className="text-sm text-red-800">
+                <div className="font-medium mb-0.5">Take a Breather</div>
+                <div>{a.message}</div>
+              </div>
+              <button
+                onClick={() => setAlerts((prev) => prev.filter((x) => x.id !== a.id))}
+                className="ml-auto text-xs text-red-700 hover:text-red-900"
+                aria-label="Dismiss"
+              >
+                Dismiss
+              </button>
+            </div>
+          ))}
+        </div>
 
         {/* Header */}
         {/* <div className="flex items-center justify-between">
@@ -485,17 +574,18 @@ export default function StressDashboard() {
                 variant="breathing"
               />
               <MetricCard
-                title="Confidence Level"
-                value={currentMetrics.confidenceLevel}
-                status={currentMetrics.confidenceLevel > 80 ? "normal" : "low"}
+                title="Blinking Rate"
+                value={currentMetrics.blinkRate}
+                unit=" /min"
+                status={currentMetrics.blinkRate >= 10 && currentMetrics.blinkRate <= 25 ? "normal" : currentMetrics.blinkRate < 10 ? "low" : "high"}
                 icon={<Zap className="h-4 w-4" />}
                 variant="confidence"
               />
               <MetricCard
-                title="Heart Rate"
-                value={currentMetrics.heartRate}
-                unit=" bpm"
-                status={currentMetrics.heartRate >= 60 && currentMetrics.heartRate <= 80 ? "normal" : "high"}
+                title="Posture Stress"
+                value={currentMetrics.postureStress}
+                unit=" %"
+                status={currentMetrics.postureStress < 30 ? "low" : currentMetrics.postureStress < 60 ? "normal" : currentMetrics.postureStress < 80 ? "high" : "critical"}
                 icon={<Heart className="h-4 w-4" />}
                 variant="heart"
               />
@@ -528,7 +618,26 @@ export default function StressDashboard() {
               <CardContent className="space-y-4">
                 <GradientBar label="Stress Level" value={currentMetrics.stressLevel} />
                 <GradientBar label="Breathing Stability" value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)} />
-                <GradientBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} />
+                <GradientBar label="Blinking Rate (scaled)" value={Math.max(0, Math.min(100, (currentMetrics.blinkRate / 30) * 100))} />
+                {lastPrediction && (
+                  <div className="mt-2 p-3 rounded-lg border text-sm flex items-center justify-between">
+                    <div>
+                      <div className="font-medium">Model Prediction</div>
+                      <div className="text-muted-foreground text-xs">
+                        {lastPrediction.timestamp ? new Date(lastPrediction.timestamp).toLocaleTimeString() : "Now"}
+                        {lastPrediction.window_id ? ` • ${lastPrediction.window_id}` : ""}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={lastPrediction.label === "stressed" ? "destructive" : "secondary"}>
+                        {lastPrediction.label?.toUpperCase()}
+                      </Badge>
+                      <span className="text-xs text-muted-foreground">
+                        {(lastPrediction.confidence * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                  </div>
+                )}
                 
                 {/* Real-time data indicator */}
                 {realTimeData && (
