@@ -1,21 +1,17 @@
 "use client"
 
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect } from "react"
 import { MetricCard } from "./components/metric-card"
 import { LiveChart } from "./components/live-chart"
+import { CameraFeed } from "./components/camera-feed"
 import { StatusIndicator } from "./components/status-indicator"
 import { ProgressBar } from "./components/progress-bar"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Heart, Brain, Zap, Activity, Play, Pause, RotateCcw, Camera, CameraOff } from "lucide-react"
+import { Heart, Brain, Zap, Activity, Play, Pause, RotateCcw } from "lucide-react"
 import { GradientBar } from "./components/gradient-bar"
 import { NavBar } from "./components/NavBar"
-
-type WsMsg = { type: string; payload?: any };
-
-// Agent connection status type
-type AgentStatus = "idle" | "fetching-ws-url" | "ws-connecting" | "ws-open" | "webrtc-connected" | "ws-closed" | "ws-error" | string;
 
 // Mock data generation for demonstration
 const generateMockData = () => ({
@@ -29,139 +25,6 @@ export default function StressDashboard() {
   const [isMonitoring, setIsMonitoring] = useState(false)
   const [currentMetrics, setCurrentMetrics] = useState(generateMockData())
   const [cameraConnected, setCameraConnected] = useState(false)
-  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null)
-  
-  // Agent connection state
-  const [agentStatus, setAgentStatus] = useState<AgentStatus>("idle")
-  const [wsUrl, setWsUrl] = useState<string>("")
-  const [realTimeData, setRealTimeData] = useState<any>(null)
-  
-  // WebRTC and WebSocket refs
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  const pcRef = useRef<RTCPeerConnection | null>(null)
-
-  // Start camera function (separate from monitoring)
-  const startCamera = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setCameraStream(stream);
-        setCameraConnected(true);
-      }
-    } catch (err: any) {
-      console.error("Camera access error:", err);
-      setCameraConnected(false);
-    }
-  }, []);
-
-  // Stop camera function
-  const stopCamera = useCallback(() => {
-    if (cameraStream) {
-      cameraStream.getTracks().forEach(track => track.stop());
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    setCameraStream(null);
-    setCameraConnected(false);
-  }, [cameraStream]);
-
-  // Agent connection function (now uses existing camera stream)
-  const connectToAgent = useCallback(async () => {
-    if (!cameraConnected || !cameraStream) {
-      console.error("Camera must be started before connecting to agent");
-      return;
-    }
-
-    setAgentStatus("fetching-ws-url");
-    try {
-      const resp = await fetch("/api/ws-url");
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data?.error || "Failed to get WS URL");
-      setWsUrl(data.wsUrl as string);
-      const ws = new WebSocket(data.wsUrl as string);
-      wsRef.current = ws;
-      setAgentStatus("ws-connecting");
-
-      ws.onopen = async () => {
-        setAgentStatus("ws-open");
-        
-        // Setup WebRTC after WebSocket is open
-        const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-        pcRef.current = pc;
-        cameraStream.getTracks().forEach((t) => pc.addTrack(t, cameraStream));
-
-        pc.onicecandidate = (ev) => {
-          if (ev.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
-            const msg: WsMsg = { type: "webrtc.candidate", payload: ev.candidate.toJSON() };
-            wsRef.current.send(JSON.stringify(msg));
-          }
-        };
-
-        // Create and send offer after WebSocket is ready
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        const offerMsg: WsMsg = { type: "webrtc.offer", payload: offer };
-        ws.send(JSON.stringify(offerMsg));
-        console.log("📤 Sent WebRTC offer to server");
-        
-        // Start the agent
-        ws.send(JSON.stringify({ type: "control.start", payload: {} } satisfies WsMsg));
-      };
-
-      ws.onmessage = async (e) => {
-        const msg: WsMsg = JSON.parse(e.data);
-        if (msg.type === "webrtc.answer") {
-          const pc = pcRef.current;
-          if (!pc) return;
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
-          setAgentStatus("webrtc-connected");
-        } else if (msg.type?.startsWith("logs.")) {
-          console.log("Agent log:", msg.payload?.message);
-        } else if (msg.type === "ml_data") {
-          // Handle real-time ML data from the agent
-          setRealTimeData(msg.payload);
-          if (msg.payload) {
-            // Update current metrics with real data
-            setCurrentMetrics({
-              stressLevel: msg.payload.stress_level || currentMetrics.stressLevel,
-              breathingRate: msg.payload.breathing_rate || currentMetrics.breathingRate,
-              confidenceLevel: msg.payload.confidence || currentMetrics.confidenceLevel,
-              heartRate: msg.payload.heart_rate || currentMetrics.heartRate,
-            });
-          }
-        }
-      };
-      
-      ws.onclose = () => {
-        setAgentStatus("ws-closed");
-        setIsMonitoring(false);
-      };
-      
-      ws.onerror = () => {
-        setAgentStatus("ws-error");
-        setIsMonitoring(false);
-      };
-
-    } catch (err: any) {
-      console.error("Agent connection error:", err);
-      setAgentStatus("error: " + err?.message);
-    }
-  }, [cameraConnected, cameraStream, currentMetrics]);
-
-  // Disconnect from agent
-  const disconnectFromAgent = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
-    if (pcRef.current) {
-      pcRef.current.close();
-    }
-    setAgentStatus("idle");
-    setRealTimeData(null);
-  }, []);;
 
   // const [chartData, setChartData] = useState({
   //   stress: [] as Array<{ time: string; value: number }>,
@@ -169,9 +32,9 @@ export default function StressDashboard() {
   //   confidence: [] as Array<{ time: string; value: number }>,
   // })
 
-  // Simulate real-time data updates (fallback when not connected to agent)
+  // Simulate real-time data updates
   useEffect(() => {
-    if (!isMonitoring || agentStatus === "webrtc-connected") return // Use real data when connected
+    if (!isMonitoring) return
 
     const interval = setInterval(() => {
       const newMetrics = generateMockData()
@@ -187,29 +50,14 @@ export default function StressDashboard() {
     }, 2000)
 
     return () => clearInterval(interval)
-  }, [isMonitoring, agentStatus])
+  }, [isMonitoring])
 
   useEffect(() => {
     if (!cameraConnected && isMonitoring) {
-      // Camera stopped while monitoring
+      // Camera closed while monitoring
       handleStopMonitoring()
     }
   }, [cameraConnected, isMonitoring])
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (cameraStream) {
-        cameraStream.getTracks().forEach(track => track.stop());
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-      if (pcRef.current) {
-        pcRef.current.close();
-      }
-    };
-  }, [cameraStream]);
 
 
 
@@ -228,26 +76,24 @@ export default function StressDashboard() {
     return "poor"
   }
 
-  const handleStartMonitoring = async () => {
-    if (!cameraConnected) {
-      console.error("Camera must be started before monitoring");
-      return;
-    }
-    if (agentStatus === "idle") {
-      // Connect to agent first
-      await connectToAgent();
-    }
-    setIsMonitoring(true);
+  const handleStartMonitoring = () => {
+    setIsMonitoring(true)
+    // Initialize with some data points
+    const initialTime = new Date().toLocaleTimeString()
+    const initialMetrics = generateMockData()
+    // setChartData({
+    //   stress: [{ time: initialTime, value: initialMetrics.stressLevel }],
+    //   breathing: [{ time: initialTime, value: initialMetrics.breathingRate }],
+    //   confidence: [{ time: initialTime, value: initialMetrics.confidenceLevel }],
+    // })
   }
 
   const handleStopMonitoring = () => {
     setIsMonitoring(false)
-    disconnectFromAgent()
   }
 
   const handleReset = () => {
     setIsMonitoring(false)
-    disconnectFromAgent()
     // setChartData({ stress: [], breathing: [], confidence: [] })
     setCurrentMetrics(generateMockData())
   }
@@ -263,51 +109,17 @@ export default function StressDashboard() {
 
 
         <div className="flex justify-end gap-4">
-          
-          {/* Camera Status Indicator */}
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Camera:</span>
-            <span
-              className={`
-                h-2 w-2 rounded-full 
-                ${cameraConnected ? "bg-green-500" : "bg-gray-500"}
-              `}
-            />
-            <span className="font-sm text-xs">
-              {cameraConnected ? "ACTIVE" : "INACTIVE"}
-            </span>
-          </div>
-          
-          {/* Agent Status Indicator */}
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Agent:</span>
-            <span
-              className={`
-                h-2 w-2 rounded-full 
-                ${agentStatus === "webrtc-connected" ? "bg-green-500 animate-pulse" : 
-                  agentStatus === "ws-open" || agentStatus === "ws-connecting" ? "bg-yellow-500" :
-                  agentStatus.startsWith("error") || agentStatus === "ws-error" ? "bg-red-500" : "bg-gray-500"}
-              `}
-            />
-            <span className="font-sm text-xs">
-              {agentStatus === "webrtc-connected" ? "CONNECTED" :
-               agentStatus === "ws-open" ? "WEBSOCKET" :
-               agentStatus === "ws-connecting" ? "CONNECTING" :
-               agentStatus.startsWith("error") ? "ERROR" :
-               agentStatus === "ws-error" ? "ERROR" :
-               "DISCONNECTED"}
-            </span>
-          </div>
+
 
           <div className="flex items-center gap-2">
             <span
               className={`
-                h-2 w-2 rounded-full 
-                ${isMonitoring ? "bg-green-500 animate-pulse" : "bg-red-500"}
-              `}
+      h-2 w-2 rounded-full 
+      ${isMonitoring ? "bg-green-500 animate-pulse" : "bg-red-500"}
+    `}
             />
             <span className="font-sm text-sm">
-              {isMonitoring ? "MONITORING" : "STANDBY"}
+              {isMonitoring ? "ACTIVE" : "INACTIVE"}
             </span>
           </div>
 
@@ -321,14 +133,13 @@ export default function StressDashboard() {
 
 
 
-          {/* Monitoring Control Button */}
           <Button
             onClick={isMonitoring ? handleStopMonitoring : handleStartMonitoring}
             variant={isMonitoring ? "destructive" : "default"}
             className="flex items-center gap-2"
-            disabled={!cameraConnected || agentStatus === "ws-connecting" || agentStatus === "fetching-ws-url"}
+            disabled={!cameraConnected}
           >
-            {isMonitoring ? (
+            {isMonitoring && cameraConnected ? (
               <>
                 <Pause className="h-4 w-4" />
                 Stop Monitoring
@@ -376,84 +187,25 @@ export default function StressDashboard() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Camera Feed */}
           <div className="space-y-6">
-            <Card>
-              <CardHeader>
-                <div className="flex items-center justify-between w-full">
-                <CardTitle>Live Video Feed</CardTitle>
-                 {/* Camera Control Button */}
-                <Button
-                  onClick={cameraConnected ? stopCamera : startCamera}
-                  variant={cameraConnected ? "outline" : "secondary"}
-                  className="flex items-center gap-2"
-                >
-                  {cameraConnected ? (
-                    <>
-                      <CameraOff className="h-4 w-4" />
-                      Stop Camera
-                    </>
-                  ) : (
-                    <>
-                      <Camera className="h-4 w-4" />
-                      Start Camera
-                    </>
-                  )}
-                </Button>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <div className="relative">
-                  <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    muted 
-                    className="w-full rounded border aspect-video bg-gray-100"
-                  />
-                  {!cameraConnected && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-gray-100 rounded">
-                      <div className="text-center">
-                        <Camera className="h-12 w-12 text-gray-400 mx-auto mb-2" />
-                        <div className="text-muted-foreground mb-2">
-                          Camera not started
-                        </div>
-                        <div className="text-sm text-gray-500">
-                          Click "Start Camera" to begin
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {cameraConnected && agentStatus !== "webrtc-connected" && agentStatus !== "idle" && (
-                    <div className="absolute top-2 left-2 bg-black/50 text-white px-2 py-1 rounded text-xs">
-                      {agentStatus === "fetching-ws-url" ? "Connecting to agent..." :
-                       agentStatus === "ws-connecting" ? "Establishing connection..." :
-                       agentStatus === "ws-open" ? "Setting up video feed..." :
-                       agentStatus.startsWith("error") ? "Connection failed" :
-                       "Connecting..."}
-                    </div>
-                  )}
-                  {cameraConnected && agentStatus === "webrtc-connected" && (
-                    <div className="absolute top-2 left-2 bg-green-500/80 text-white px-2 py-1 rounded text-xs">
-                      ✓ Agent Connected
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+            <CameraFeed onCameraStatusChange={(connected) => setCameraConnected(connected)} />
             {/* Status Indicators */}
             <Card>
               <CardHeader>
-                <CardTitle>System Status</CardTitle>
+                <CardTitle>Overall Status</CardTitle>
               </CardHeader>
               <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <StatusIndicator 
-                  status={cameraConnected ? "excellent" : "critical"} 
-                  label="Camera Status" 
-                />
-                <StatusIndicator 
-                  status={agentStatus === "webrtc-connected" ? "excellent" : agentStatus === "ws-open" ? "good" : agentStatus.startsWith("error") ? "critical" : "moderate"} 
-                  label="Agent Connection" 
-                />
                 <StatusIndicator status={getStressStatus(currentMetrics.stressLevel)} label="Stress Level" />
+                <StatusIndicator status={getBreathingStatus(currentMetrics.breathingRate)} label="Breathing Pattern" />
+                <StatusIndicator
+                  status={
+                    currentMetrics.confidenceLevel > 80
+                      ? "excellent"
+                      : currentMetrics.confidenceLevel > 60
+                        ? "good"
+                        : "moderate"
+                  }
+                  label="Analysis Confidence"
+                />
               </CardContent>
             </Card>
           </div>
@@ -529,29 +281,17 @@ export default function StressDashboard() {
                 <GradientBar label="Stress Level" value={currentMetrics.stressLevel} />
                 <GradientBar label="Breathing Stability" value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)} />
                 <GradientBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} />
-                
-                {/* Real-time data indicator */}
-                {realTimeData && (
-                  <div className="mt-4 p-3 bg-green-50 rounded-lg border border-green-200">
-                    <div className="text-sm font-medium text-green-800 mb-1">
-                      Real-time Agent Data
-                    </div>
-                    <div className="text-xs text-green-600">
-                      Last update: {new Date().toLocaleTimeString()}
-                    </div>
-                  </div>
-                )}
-                
-                {agentStatus === "webrtc-connected" && !realTimeData && (
-                  <div className="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
-                    <div className="text-sm font-medium text-blue-800 mb-1">
-                      Waiting for ML Analysis
-                    </div>
-                    <div className="text-xs text-blue-600">
-                      Agent connected, processing video feed...
-                    </div>
-                  </div>
-                )}
+                {/* <ProgressBar
+                label="Stress Level"
+                value={currentMetrics.stressLevel}
+                color={currentMetrics.stressLevel < 50 ? "success" : currentMetrics.stressLevel < 75 ? "warning" : "danger"}
+              />
+              <ProgressBar
+                label="Breathing Stability"
+                value={Math.max(0, 100 - Math.abs(currentMetrics.breathingRate - 14) * 10)}
+                color="primary"
+              />
+              <ProgressBar label="Analysis Confidence" value={currentMetrics.confidenceLevel} color="secondary" /> */}
               </CardContent>
             </Card>
 

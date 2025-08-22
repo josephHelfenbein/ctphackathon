@@ -102,19 +102,26 @@ with suppress_stderr():
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
 
+# Module-level singletons to avoid storing heavy objects in LangGraph state
+_BREATHING_TRACKER = None
+_FEATURE_EXTRACTOR = None
+_ML_AGGREGATOR = None
+_POSE_MODEL = None
+_FACE_MODEL = None
+
 
 class BreathingTracker:
     """
     Highly sensitive breathing detection using both head and shoulder movements.
     Designed to detect even subtle breathing patterns with multiple signal sources.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  fps: float = 30.0,
-                 window_seconds: float = 5.0,
-                 min_amplitude: float = 0.0001,     # Very low threshold for subtle movements
-                 min_cycle_time: float = 1.0,       # Minimum 1 second per breath cycle (60 BPM max)
-                 max_cycle_time: float = 8.0,       # Maximum 8 seconds per breath cycle (7.5 BPM min)
+                 window_seconds: float = 10.0,
+                 min_amplitude: float = 0.0001,
+                 min_cycle_time: float = 1.2,
+                 max_cycle_time: float = 12.0,
                  smoothing_window: int = 3):
         self.fps = fps
         self.window_seconds = window_seconds
@@ -123,52 +130,45 @@ class BreathingTracker:
         self.min_cycle_time = min_cycle_time
         self.max_cycle_time = max_cycle_time
         self.smoothing_window = smoothing_window
-        
+
         # Data storage for multiple signals
         self.timestamps = deque(maxlen=self.window_frames * 2)
         self.head_y = deque(maxlen=self.window_frames * 2)
         self.shoulder_y = deque(maxlen=self.window_frames * 2)
         self.torso_center_y = deque(maxlen=self.window_frames * 2)
         self.combined_signal = deque(maxlen=self.window_frames * 2)
-        
+        self.filtered_signal = deque(maxlen=self.window_frames * 2)
+
         # Peak detection for breathing cycles
         self.peaks = deque(maxlen=50)
         self.valleys = deque(maxlen=50)
         self.last_peak_time = 0.0
         self.last_valley_time = 0.0
-        
+
         # Calibration and baselines
         self.calibration_frames = 0
-        self.calibration_target = int(2 * fps)  # 2 seconds to calibrate
+        self.calibration_target = int(2 * fps)
         self.is_calibrated = False
         self.baseline_head_y = None
         self.baseline_shoulder_y = None
-        self.signal_range = 0.001  # Adaptive signal range
-        
+        self.signal_range = 0.001
+
         # Current state
         self.current_bpm = 0.0
         self.confidence = 0.0
-        self.movement_direction = 0  # -1 down, 0 neutral, 1 up
-        
+        self.movement_direction = 0
+
+        # Filtering params for robust BPM (band 0.05–0.5 Hz ≈ 3–30 BPM)
+        self._bp_b, self._bp_a = None, None
+        self._last_filter_fs = None
+
     def update(self, timestamp: float, nose: Tuple[float, float, float],
-               left_shoulder: Tuple[float, float, float], 
+               left_shoulder: Tuple[float, float, float],
                right_shoulder: Tuple[float, float, float]) -> Dict[str, Any]:
-        """
-        Process head and shoulder landmarks for breathing detection.
-        
-        Args:
-            timestamp: Current timestamp in seconds
-            nose: (x, y, z) coordinates of nose (head proxy)
-            left_shoulder: (x, y, z) coordinates of left shoulder
-            right_shoulder: (x, y, z) coordinates of right shoulder
-            
-        Returns:
-            Dictionary with breathing metrics
-        """
-        
-        # Safety check: Reset if buffers get unexpectedly large (memory leak prevention)
+        """Process landmarks and update breathing metrics."""
+
+        # Safety check for buffer overflow
         if len(self.timestamps) > self.window_frames * 3:
-            print(f"⚠️ BREATHING TRACKER RESET: Buffer overflow detected ({len(self.timestamps)} > {self.window_frames * 3})")
             self.timestamps.clear()
             self.head_y.clear()
             self.shoulder_y.clear()
@@ -178,18 +178,18 @@ class BreathingTracker:
             self.valleys.clear()
             self.is_calibrated = False
             self.calibration_frames = 0
-        
+
         # Calculate key points
-        head_y = nose[1]  # Y-coordinate of head
+        head_y = nose[1]
         shoulder_midpoint_y = (left_shoulder[1] + right_shoulder[1]) / 2
         torso_center_y = (head_y + shoulder_midpoint_y) / 2
-        
+
         # Store data
         self.timestamps.append(timestamp)
         self.head_y.append(head_y)
         self.shoulder_y.append(shoulder_midpoint_y)
         self.torso_center_y.append(torso_center_y)
-        
+
         # Calibration phase
         if not self.is_calibrated:
             self.calibration_frames += 1
@@ -197,51 +197,46 @@ class BreathingTracker:
                 self.baseline_head_y = head_y
                 self.baseline_shoulder_y = shoulder_midpoint_y
             else:
-                # Update baselines
                 alpha = 0.1
                 self.baseline_head_y = (1 - alpha) * self.baseline_head_y + alpha * head_y
                 self.baseline_shoulder_y = (1 - alpha) * self.baseline_shoulder_y + alpha * shoulder_midpoint_y
-            
+
             if self.calibration_frames >= self.calibration_target:
                 self.is_calibrated = True
-                print(f"🫁 Breathing tracker calibrated with baselines: head={self.baseline_head_y:.4f}, shoulder={self.baseline_shoulder_y:.4f}")
-            
-            return {
-                "bpm": 0.0,
-                "confidence": 0.0,
-                "calibrated": False,
-                "status": "calibrating"
-            }
-        
-        # Create combined breathing signal from multiple sources
+
+            return {"bpm": 0.0, "confidence": 0.0, "calibrated": False, "status": "calibrating"}
+
+        # Build combined signal
         head_deviation = head_y - self.baseline_head_y
         shoulder_deviation = shoulder_midpoint_y - self.baseline_shoulder_y
-        
-        # Weight head movement more as it's typically more pronounced during breathing
-        combined_signal = 0.7 * head_deviation + 0.3 * shoulder_deviation
+        combined_signal = 0.4 * head_deviation + 0.6 * shoulder_deviation
         self.combined_signal.append(combined_signal)
-        
-        # Need enough data points for analysis
-        if len(self.combined_signal) < 30:  # 1 second at 30 fps
-            return {
-                "bpm": 0.0,
-                "confidence": 0.0,
-                "calibrated": True,
-                "status": "insufficient_data"
-            }
-        
-        # Smooth the signal
-        smoothed_signal = self._smooth_signal(list(self.combined_signal)[-30:])  # Last 1 second
-        
-        # Detect peaks and valleys for breathing cycles
-        self._detect_breathing_cycles(timestamp, smoothed_signal[-1] if smoothed_signal else 0)
-        
-        # Calculate BPM from recent breathing cycles
-        bpm, confidence = self._calculate_bpm(timestamp)
-        
+
+        # Need enough data points
+        if len(self.combined_signal) < 30:
+            return {"bpm": 0.0, "confidence": 0.0, "calibrated": True, "status": "insufficient_data"}
+
+        # Filtering for robustness (limit horizon to last window_seconds)
+        recent_sig = list(self.combined_signal)[-int(self.fps):]
+        smoothed_signal = self._smooth_signal(recent_sig)
+        filtered_sig = self._bandpass_filter(list(self.combined_signal)[-self.window_frames:])
+        current_filtered = filtered_sig[-1] if filtered_sig else (smoothed_signal[-1] if smoothed_signal else 0.0)
+        self.filtered_signal.append(current_filtered)
+
+        # Peak/valley detection
+        self._detect_breathing_cycles(timestamp, current_filtered)
+
+        # BPM estimates
+        bpm_peaks, conf_peaks = self._calculate_bpm(timestamp)
+        bpm_ac, conf_ac = self._estimate_bpm_autocorr()
+        if bpm_ac > 0 and (conf_ac >= conf_peaks or bpm_peaks == 0):
+            bpm, confidence = bpm_ac, conf_ac
+        else:
+            bpm, confidence = bpm_peaks, conf_peaks
+
         self.current_bpm = bpm
         self.confidence = confidence
-        
+
         return {
             "bpm": round(bpm, 1),
             "confidence": round(confidence, 3),
@@ -252,92 +247,111 @@ class BreathingTracker:
                 "shoulder_y": round(shoulder_midpoint_y, 4),
                 "head_deviation": round(head_deviation, 4),
                 "shoulder_deviation": round(shoulder_deviation, 4),
-                "combined_signal": round(combined_signal, 4),
-                "recent_peaks": len(self.peaks),
-                "recent_valleys": len(self.valleys)
+                "combined_signal": round(combined_signal, 4)
             }
         }
-    
-    def _smooth_signal(self, signal: List[float]) -> List[float]:
-        """Apply simple moving average smoothing."""
-        if len(signal) < self.smoothing_window:
-            return signal
-        
+
+    def _smooth_signal(self, signal_list: List[float]) -> List[float]:
+        if len(signal_list) < self.smoothing_window:
+            return signal_list
         smoothed = []
-        for i in range(len(signal)):
+        for i in range(len(signal_list)):
             start_idx = max(0, i - self.smoothing_window + 1)
             end_idx = i + 1
-            window_values = signal[start_idx:end_idx]
+            window_values = signal_list[start_idx:end_idx]
             smoothed.append(sum(window_values) / len(window_values))
-        
         return smoothed
-    
+
     def _detect_breathing_cycles(self, timestamp: float, current_signal: float):
-        """Detect peaks and valleys in the breathing signal."""
-        if len(self.combined_signal) < 3:
+        if len(self.filtered_signal) < 3:
             return
-        
-        # Get recent signal values
-        signals = list(self.combined_signal)[-3:]
-        
-        # Check for peak (local maximum)
+        signals = list(self.filtered_signal)[-3:]
         if len(signals) >= 3 and signals[1] > signals[0] and signals[1] > signals[2]:
-            # Ensure minimum time between peaks and sufficient amplitude
-            if (timestamp - self.last_peak_time > self.min_cycle_time / 2 and 
-                abs(signals[1]) > self.min_amplitude):
+            if (timestamp - self.last_peak_time > self.min_cycle_time / 2 and abs(signals[1]) > self.min_amplitude):
                 self.peaks.append({"time": timestamp, "value": signals[1]})
                 self.last_peak_time = timestamp
-                self.movement_direction = -1  # Start of exhale
-        
-        # Check for valley (local minimum)
+                self.movement_direction = -1
         elif len(signals) >= 3 and signals[1] < signals[0] and signals[1] < signals[2]:
-            # Ensure minimum time between valleys and sufficient amplitude
-            if (timestamp - self.last_valley_time > self.min_cycle_time / 2 and 
-                abs(signals[1]) > self.min_amplitude):
+            if (timestamp - self.last_valley_time > self.min_cycle_time / 2 and abs(signals[1]) > self.min_amplitude):
                 self.valleys.append({"time": timestamp, "value": signals[1]})
                 self.last_valley_time = timestamp
-                self.movement_direction = 1  # Start of inhale
-    
+                self.movement_direction = 1
+
     def _calculate_bpm(self, timestamp: float) -> Tuple[float, float]:
-        """Calculate breathing rate from recent peaks and valleys."""
-        # Filter recent peaks and valleys (within window)
         recent_peaks = [p for p in self.peaks if timestamp - p["time"] <= self.window_seconds]
         recent_valleys = [v for v in self.valleys if timestamp - v["time"] <= self.window_seconds]
-        
-        # Need at least 2 complete cycles (2 peaks and 2 valleys)
         if len(recent_peaks) < 2 or len(recent_valleys) < 2:
             return 0.0, 0.0
-        
-        # Calculate cycle times from peaks
         peak_times = [p["time"] for p in recent_peaks]
         peak_intervals = [peak_times[i] - peak_times[i-1] for i in range(1, len(peak_times))]
-        
-        # Calculate cycle times from valleys
         valley_times = [v["time"] for v in recent_valleys]
         valley_intervals = [valley_times[i] - valley_times[i-1] for i in range(1, len(valley_times))]
-        
-        # Combine intervals and filter valid ones
         all_intervals = peak_intervals + valley_intervals
-        valid_intervals = [interval for interval in all_intervals 
-                          if self.min_cycle_time <= interval <= self.max_cycle_time]
-        
+        valid_intervals = [iv for iv in all_intervals if self.min_cycle_time <= iv <= self.max_cycle_time]
         if not valid_intervals:
             return 0.0, 0.0
-        
-        # Calculate average cycle time and convert to BPM
-        avg_cycle_time = sum(valid_intervals) / len(valid_intervals)
-        bpm = 60.0 / avg_cycle_time
-        
-        # Calculate confidence based on consistency of intervals
+        avg_cycle = sum(valid_intervals) / len(valid_intervals)
+        bpm = 60.0 / avg_cycle
         if len(valid_intervals) > 1:
-            interval_std = (sum((x - avg_cycle_time) ** 2 for x in valid_intervals) / len(valid_intervals)) ** 0.5
-            consistency = max(0, 1 - (interval_std / avg_cycle_time))
-            data_completeness = min(1.0, len(valid_intervals) / 3)  # Prefer 3+ intervals
-            confidence = consistency * data_completeness
+            interval_std = (sum((x - avg_cycle) ** 2 for x in valid_intervals) / len(valid_intervals)) ** 0.5
+            consistency = max(0, 1 - (interval_std / avg_cycle))
+            data_compl = min(1.0, len(valid_intervals) / 3)
+            conf = consistency * data_compl
         else:
-            confidence = 0.3  # Low confidence with single interval
-        
-        return bpm, confidence
+            conf = 0.3
+        return bpm, conf
+
+    def _estimate_bpm_autocorr(self) -> Tuple[float, float]:
+        try:
+            n = len(self.combined_signal)
+            if n < int(self.fps * 3):
+                return 0.0, 0.0
+            horizon = int(min(n, self.fps * self.window_seconds))
+            raw_sig = np.array(list(self.combined_signal)[-horizon:], dtype=np.float32)
+            sig = self._bandpass_filter(raw_sig.tolist())
+            sig = np.array(sig, dtype=np.float32)
+            if np.allclose(sig, sig[0]):
+                return 0.0, 0.0
+            sig = sig - np.mean(sig)
+            if np.max(np.abs(sig)) < 1e-6:
+                return 0.0, 0.0
+            acf = np.correlate(sig, sig, mode='full')
+            acf = acf[acf.size // 2:]
+            if acf[0] <= 0:
+                return 0.0, 0.0
+            min_lag = int(self.fps * self.min_cycle_time)
+            max_lag = int(self.fps * self.max_cycle_time)
+            max_lag = min(max_lag, len(acf) - 1)
+            if max_lag <= min_lag + 1:
+                return 0.0, 0.0
+            search = acf[min_lag:max_lag]
+            peak_idx = int(np.argmax(search)) + min_lag
+            peak_val = float(acf[peak_idx])
+            cycle_time = peak_idx / self.fps
+            if cycle_time <= 0:
+                return 0.0, 0.0
+            bpm = 60.0 / cycle_time
+            conf = max(0.0, min(1.0, peak_val / (acf[0] + 1e-8)))
+            return bpm, conf
+        except Exception:
+            return 0.0, 0.0
+
+    def _bandpass_filter(self, sig: List[float]) -> List[float]:
+        try:
+            if not sig or len(sig) < int(self.fps * 2):
+                return sig
+            fs = float(self.fps)
+            if self._bp_b is None or self._last_filter_fs != fs:
+                low = 0.05 / (fs / 2.0)
+                high = 1.0 / (fs / 2.0)
+                low = max(1e-6, min(low, 0.99))
+                high = max(low + 1e-6, min(high, 0.99))
+                self._bp_b, self._bp_a = signal.butter(2, [low, high], btype='band')
+                self._last_filter_fs = fs
+            filtered = signal.filtfilt(self._bp_b, self._bp_a, np.asarray(sig, dtype=np.float32))
+            return filtered.tolist()
+        except Exception:
+            return self._smooth_signal(sig)
         
 
 class MLDataAggregator:
@@ -348,8 +362,11 @@ class MLDataAggregator:
     
     def __init__(self, window_seconds=5, fps=30.0):
         self.window_seconds = window_seconds
+        self.fps = fps
         self.window_size = int(window_seconds * fps)  # Still use for maxlen, but not for export trigger
         self.data_buffer = deque(maxlen=self.window_size)
+        # Maintain a longer rolling buffer for eye openness to smooth blink rate (10s)
+        self.eye_roll_buffer = deque(maxlen=int(10 * fps))  # stores (timestamp, avg_openness)
         self.export_counter = 0
         self.last_export_time = None
         
@@ -359,6 +376,15 @@ class MLDataAggregator:
         current_time = time.time()
         
         self.data_buffer.append(frame_data)
+        # Extend rolling eye buffer per frame to improve blink frequency stability
+        try:
+            if frame_data.get("has_face", False):
+                ef = frame_data.get("ml_features", {}).get("eye_features", {})
+                if ef:
+                    avg_open = (ef.get("left_eye_openness", 1.0) + ef.get("right_eye_openness", 1.0)) / 2.0
+                    self.eye_roll_buffer.append((frame_data.get("timestamp", current_time), float(avg_open)))
+        except Exception:
+            pass
         
         # Time-based export: check if enough time has passed since last export
         if self.last_export_time is None:
@@ -377,23 +403,43 @@ class MLDataAggregator:
     
     def _aggregate_window(self) -> Dict[str, Any]:
         """Aggregate data from the current window into ML features."""
-        breathing_data = []
-        facial_features = []
-        eye_features = []
-        posture_features = []
+        breathing_data: List[Dict[str, Any]] = []
+        facial_features: List[Dict[str, Any]] = []
+        eye_features: List[Dict[str, Any]] = []
+        posture_features: List[Dict[str, Any]] = []
         
         for frame in self.data_buffer:
             ml_features = frame.get("ml_features", {})
-            if ml_features and (ml_features.get("calibrated", False) or 
-                              ml_features.get("breathing_features", {}).get("bpm", 0) > 0):
-                breathing_data.append(ml_features.get("breathing_features", {}))
+            if not ml_features:
+                continue
+            # Always collect per-modality data when present
+            if frame.get("has_face", False):
                 facial_features.append(ml_features.get("facial_features", {}))
                 eye_features.append(ml_features.get("eye_features", {}))
+            if frame.get("has_pose", False):
                 posture_features.append(ml_features.get("posture_features", {}))
+            # Collect breathing only when the breathing sub-feature is calibrated or has bpm>0
+            bf = ml_features.get("breathing_features", {})
+            if bf and (frame.get("breathing", {}).get("calibrated", False) or bf.get("bpm", 0) > 0):
+                breathing_data.append(bf)
         
-        if len(breathing_data) < len(self.data_buffer) * 0.1:
-            return {"status": "insufficient_data", "valid_frames": len(breathing_data), "total_frames": len(self.data_buffer)}
-        
+        # Estimate FPS for this window
+        duration = max(1e-6, self.data_buffer[-1]["timestamp"] - self.data_buffer[0]["timestamp"])
+        fps_est = len(self.data_buffer) / duration if duration > 0 else 30.0
+
+        # Build 10s rolling eye series ending at window end for blink rate
+        roll_series: List[float] = []
+        roll_duration_s = 0.0
+        try:
+            t_end = self.data_buffer[-1]["timestamp"]
+            t_start = t_end - 10.0
+            recent = [item for item in self.eye_roll_buffer if item[0] >= t_start]
+            if recent:
+                roll_series = [v for (_, v) in recent]
+                roll_duration_s = max(1e-6, recent[-1][0] - recent[0][0])
+        except Exception:
+            pass
+
         aggregated = {
             "window_id": self.export_counter,
             "timestamp_start": self.data_buffer[0]["timestamp"],
@@ -401,14 +447,15 @@ class MLDataAggregator:
             "duration_seconds": self.data_buffer[-1]["timestamp"] - self.data_buffer[0]["timestamp"],
             "frame_count": len(self.data_buffer),
             "valid_frames": len(breathing_data),
+            "estimated_fps": fps_est,
             
-            "breathing_analysis": self._aggregate_breathing(breathing_data),
-            "facial_analysis": self._aggregate_facial(facial_features),
-            "eye_analysis": self._aggregate_eye(eye_features),
-            "posture_analysis": self._aggregate_posture(posture_features),
+            "breathing_analysis": self._aggregate_breathing(breathing_data) if breathing_data else {"status": "no_breathing_data"},
+            "facial_analysis": self._aggregate_facial(facial_features) if facial_features else {"status": "no_facial_data"},
+            "eye_analysis": self._aggregate_eye(eye_features, fps_est=fps_est, rolling_series=roll_series, rolling_duration_s=roll_duration_s) if eye_features else {"status": "no_eye_data"},
+            "posture_analysis": self._aggregate_posture(posture_features) if posture_features else {"status": "no_posture_data"},
             "behavioral_patterns": self._analyze_behavioral_patterns(
                 breathing_data, facial_features, eye_features, posture_features
-            )
+            ) if breathing_data and facial_features and eye_features else {"status": "insufficient_data_for_correlation"}
         }
         
         return aggregated
@@ -465,14 +512,38 @@ class MLDataAggregator:
         
         if not jaw_width:
             return {"status": "no_facial_data"}
-        
+        # Per-frame normalization by jaw width to reduce scale bias
+        norm_curv = []
+        for f in facial_data:
+            jw = f.get("jaw_width", 0.0)
+            mc = f.get("mouth_curvature", 0.0)
+            if jw > 0:
+                norm_curv.append(mc / (jw + 1e-6))
+            else:
+                norm_curv.append(0.0)
+        # Light smoothing (moving average window=5)
+        if len(norm_curv) >= 5:
+            smoothed = []
+            w = 5
+            for i in range(len(norm_curv)):
+                s = max(0, i - (w - 1))
+                smoothed.append(float(np.mean(norm_curv[s:i+1])))
+            norm_curv = smoothed
+        # Adaptive thresholds using MAD with floors
+        curv_med = float(np.median(norm_curv)) if norm_curv else 0.0
+        mad = float(np.median(np.abs(np.array(norm_curv) - curv_med))) + 1e-6
+        smile_thr = max(0.02, curv_med + 0.8 * mad)
+        frown_thr = min(-0.02, curv_med - 0.8 * mad)
+        smile_freq = (len([c for c in norm_curv if c > smile_thr]) / len(norm_curv)) if norm_curv else 0.0
+        frown_freq = (len([c for c in norm_curv if c < frown_thr]) / len(norm_curv)) if norm_curv else 0.0
+
         return {
             "mean_jaw_width": np.mean(jaw_width),
             "jaw_width_std": np.std(jaw_width),
             "jaw_tension_episodes": len([j for j in jaw_width if j < np.mean(jaw_width) - np.std(jaw_width)]),
             "mean_mouth_curvature": np.mean(mouth_curvature),
-            "smile_frequency": len([m for m in mouth_curvature if m > 0.01]) / len(mouth_curvature),
-            "frown_frequency": len([m for m in mouth_curvature if m < -0.01]) / len(mouth_curvature),
+            "smile_frequency": smile_freq,
+            "frown_frequency": frown_freq,
             "expression_stability": 1.0 - np.std(mouth_curvature),
             "mean_eyebrow_height": np.mean(eyebrow_height) if eyebrow_height else 0.0,
             "eyebrow_height_std": np.std(eyebrow_height) if eyebrow_height else 0.0,
@@ -481,25 +552,108 @@ class MLDataAggregator:
             "facial_stability_score": self._calculate_facial_stability(facial_data)
         }
     
-    def _aggregate_eye(self, eye_data: List[Dict]) -> Dict[str, float]:
-        """Aggregate eye behavior patterns."""
+    def _aggregate_eye(self, eye_data: List[Dict], fps_est: float = 30.0, rolling_series: Optional[List[float]] = None, rolling_duration_s: float = 0.0) -> Dict[str, float]:
+        """Aggregate eye behavior patterns. fps_est improves blink frequency accuracy."""
         if not eye_data:
             return {}
             
         left_openness = [e.get("left_eye_openness", 1.0) for e in eye_data]
         right_openness = [e.get("right_eye_openness", 1.0) for e in eye_data]
+        avg_series = [(l + r) / 2.0 for l, r in zip(left_openness, right_openness)]
         asymmetry = [e.get("eye_asymmetry", 0.0) for e in eye_data]
         
+        # Robust blink estimate using MAD thresholds + hysteresis state machine
+        # Compute blink frequency over a longer rolling horizon (up to 10s) for smoother, less quantized rate
+        blink_freq = 0.0
+        perclos = 0.0
+        # Prefer rolling series if available, else fall back to current window
+        series_src = None
+        duration_s = 0.0
+        if rolling_series and len(rolling_series) >= max(10, int(0.5 * fps_est)) and rolling_duration_s > 0:
+            series = np.array(rolling_series, dtype=np.float32)
+            series_src = "rolling"
+            duration_s = rolling_duration_s
+        elif len(avg_series) >= max(10, int(0.5 * fps_est)):
+            series = np.array(avg_series, dtype=np.float32)
+            series_src = "window"
+            duration_s = max(1e-6, len(series) / max(1.0, fps_est))
+        else:
+            series = None
+        
+        if series is not None:
+            med = float(np.median(series))
+            mad = float(np.median(np.abs(series - med))) + 1e-6
+            # Hysteresis thresholds: enter closed when below close_thr, exit when above open_thr
+            close_thr = med - 1.2 * mad
+            open_thr = med - 0.4 * mad
+            if open_thr <= close_thr:
+                open_thr = close_thr + 0.3 * mad
+            # PERCLOS: time below 80% of median openness or below close_thr
+            perclos_thresh = min(0.8 * med, close_thr)
+            perclos = float(np.mean(series < perclos_thresh))
+            # State machine
+            in_closed = False
+            closed_start = 0
+            blinks = 0
+            refractory = 0
+            min_close = max(1, int(0.08 * fps_est))     # >=80 ms closure
+            max_close = max(min_close, int(0.8 * fps_est))  # <=0.8s
+            refr_frames = max(1, int(0.15 * fps_est))   # 150 ms refractory
+            for i, val in enumerate(series):
+                if refractory > 0:
+                    refractory -= 1
+                if not in_closed:
+                    if val < close_thr and refractory == 0:
+                        in_closed = True
+                        closed_start = i
+                else:
+                    # Wait until it re-opens beyond open_thr
+                    if val > open_thr:
+                        dur = i - closed_start
+                        if min_close <= dur <= max_close:
+                            blinks += 1
+                            refractory = refr_frames
+                        in_closed = False
+            # Prefer median inter-blink interval for smoother, continuous rate when >=2 blinks
+            if blinks >= 2:
+                # Estimate IBI from event indices
+                event_idxs = []
+                in_closed = False
+                refractory = 0
+                for i, val in enumerate(series):
+                    if refractory > 0:
+                        refractory -= 1
+                    if not in_closed and val < close_thr and refractory == 0:
+                        in_closed = True
+                        start_i = i
+                    elif in_closed and val > open_thr:
+                        dur = i - start_i
+                        if min_close <= dur <= max_close:
+                            event_idxs.append(i)
+                            refractory = refr_frames
+                        in_closed = False
+                ibis = [ (event_idxs[i] - event_idxs[i-1]) / max(1.0, fps_est) for i in range(1, len(event_idxs)) ]
+                if ibis:
+                    blink_freq = 60.0 / max(1e-3, float(np.median(ibis)))
+                else:
+                    duration_minutes = max(1e-6, duration_s / 60.0)
+                    blink_freq = blinks / duration_minutes
+            else:
+                duration_minutes = max(1e-6, duration_s / 60.0)
+                blink_freq = blinks / duration_minutes
+
         return {
-            "mean_eye_openness": np.mean([(l + r) / 2 for l, r in zip(left_openness, right_openness)]),
-            "eye_openness_std": np.std([(l + r) / 2 for l, r in zip(left_openness, right_openness)]),
-            "low_openness_episodes": len([o for o in left_openness if o < 0.02]),
-            "blink_frequency": self._estimate_blink_frequency(left_openness),
+            "mean_eye_openness": np.mean(avg_series),
+            "eye_openness_std": np.std(avg_series),
+            "low_openness_episodes": len([o for o in avg_series if o < 0.6 * (np.median(avg_series) if len(avg_series)>0 else 0.0)]),
+            "blink_frequency": blink_freq,
             "mean_asymmetry": np.mean(asymmetry),
             "high_asymmetry_episodes": len([a for a in asymmetry if a > 0.05]),
-            "eye_fatigue_trend": self._calculate_trend([(l + r) / 2 for l, r in zip(left_openness, right_openness)]),
+            "eye_fatigue_trend": self._calculate_trend(avg_series),
             "eye_stability": 1.0 - np.std(asymmetry),
-            "sustained_attention_score": self._calculate_attention_score(left_openness, right_openness)
+            "sustained_attention_score": self._calculate_attention_score(left_openness, right_openness),
+            "perclos": perclos,
+            "blink_rate_horizon_seconds": float(duration_s) if series is not None else 0.0
         }
     
     def _aggregate_posture(self, posture_data: List[Dict]) -> Dict[str, float]:
@@ -605,7 +759,9 @@ class MLDataAggregator:
         if len(openness_values) < 10:
             return 0.0
         blinks = 0
-        threshold = 0.01
+        # Adaptive threshold: half the median openness, with a sensible floor
+        median_open = float(np.median(openness_values)) if openness_values else 0.02
+        threshold = max(0.005, 0.5 * median_open)
         for i in range(1, len(openness_values)):
             if openness_values[i-1] > threshold and openness_values[i] <= threshold:
                 blinks += 1
@@ -702,7 +858,9 @@ class FeatureExtractor:
             "eye_features": self._extract_eye_features(face_data),
             "posture_features": self._extract_posture_features(pose_data),
             "temporal_features": self._extract_temporal_features(),
-            "calibrated": self.baseline_samples >= self.baseline_target
+            # Consider extractor calibrated only when both extractor baselines and breathing tracker are calibrated
+            "calibrated": (self.baseline_samples >= self.baseline_target) and bool(breathing_data.get("calibrated", False)),
+            "breathing_calibrated": bool(breathing_data.get("calibrated", False)),
         }
         
         self._update_history(features)
@@ -784,8 +942,37 @@ class FeatureExtractor:
         breakdown = face_data.get("feature_breakdown", {})
         features = self._extract_facial_landmarks(coords, breakdown)
         
-        left_openness = self._measure_eye_openness(features.get("left_eye", []))
-        right_openness = self._measure_eye_openness(features.get("right_eye", []))
+        # Prefer robust EAR-based openness using index_map if available
+        if "index_map" in face_data:
+            im = face_data["index_map"]
+            def ear(left_corner, right_corner, top1, bottom1, top2=None, bottom2=None) -> float:
+                try:
+                    # Horizontal eye width
+                    x1, y1, _ = im[left_corner]
+                    x2, y2, _ = im[right_corner]
+                    w = ((x2 - x1)**2 + (y2 - y1)**2) ** 0.5
+                    # Vertical distances (use one or two pairs)
+                    xt1, yt1, _ = im[top1]
+                    xb1, yb1, _ = im[bottom1]
+                    h1 = abs(yb1 - yt1)
+                    if top2 is not None and bottom2 is not None and top2 in im and bottom2 in im:
+                        xt2, yt2, _ = im[top2]
+                        xb2, yb2, _ = im[bottom2]
+                        h2 = abs(yb2 - yt2)
+                        h = 0.5 * (h1 + h2)
+                    else:
+                        h = h1
+                    # Return normalized EAR-like ratio (vertical/width)
+                    return max(0.0, h / (w + 1e-6))
+                except Exception:
+                    return 0.0
+            # Left: vertical pairs (159,145) and (160,144)
+            left_openness = ear(33, 133, 159, 145, 160, 144)
+            # Right: vertical pairs (386,374) and (385,380)
+            right_openness = ear(362, 263, 386, 374, 385, 380)
+        else:
+            left_openness = self._measure_eye_openness(features.get("left_eye", []))
+            right_openness = self._measure_eye_openness(features.get("right_eye", []))
         avg_openness = (left_openness + right_openness) / 2
         
         eye_asymmetry = abs(left_openness - right_openness)
@@ -1057,16 +1244,13 @@ class FeatureExtractor:
 
 
 class AgentState(TypedDict):
-    frame: Optional[np.ndarray]
+    # Keep state lean: do NOT store raw frames or heavy native objects here.
     pose_landmarks: Optional[Any]
     face_landmarks: Optional[Any]
     frame_count: int
     last_detection_time: float
     status: str
     landmark_data: Optional[Dict[str, Any]]
-    breathing_tracker: Optional[Any]
-    feature_extractor: Optional[Any]
-    ml_aggregator: Optional[Any]
 
 def load_latest_frame() -> Optional[np.ndarray]:
     """Load the latest frame with corruption protection and multiple attempts."""
@@ -1112,51 +1296,42 @@ def load_latest_frame() -> Optional[np.ndarray]:
 
 
 def capture_frame_node(state: AgentState) -> AgentState:
-    """Node: Capture the latest frame from WebRTC."""
+    """Node: Probe for a new frame without storing it in state."""
     frame = load_latest_frame()
-    
     if frame is not None:
-        state["frame"] = frame
-        state["frame_count"] = state.get("frame_count", 0) + 1
         state["status"] = "frame_captured"
-        # Print processing message every 10 frames to monitor actual frame rate
-        if state["frame_count"] % 10 == 1:
-            print(f"📸 Processing frame #{state['frame_count']}")
     else:
         state["status"] = "no_frame"
         if state.get("frame_count", 0) % 50 == 0:
             print("⚠️ No frame available")
-    
     return state
 
 
 def detect_pose_node(state: AgentState) -> AgentState:
     """Node: Detect pose and face landmarks using MediaPipe for ML models with stress analysis."""
-    frame = state.get("frame")
+    # Load frame locally, never store in state
+    frame = load_latest_frame()
     
-    # Initialize components once and reuse them
-    if state["breathing_tracker"] is None:
-        state["breathing_tracker"] = BreathingTracker(fps=30.0)
-    if state["feature_extractor"] is None:
-        state["feature_extractor"] = FeatureExtractor()
-    if state["ml_aggregator"] is None:
-        state["ml_aggregator"] = MLDataAggregator(window_seconds=5, fps=30.0)
-    
-    # Initialize MediaPipe models once for performance
-    if "pose_model" not in state:
+    # Initialize components once as module-level singletons
+    global _BREATHING_TRACKER, _FEATURE_EXTRACTOR, _ML_AGGREGATOR, _POSE_MODEL, _FACE_MODEL
+    if _BREATHING_TRACKER is None:
+        _BREATHING_TRACKER = BreathingTracker(fps=30.0, window_seconds=5.0)
+    if _FEATURE_EXTRACTOR is None:
+        _FEATURE_EXTRACTOR = FeatureExtractor()
+    if _ML_AGGREGATOR is None:
+        _ML_AGGREGATOR = MLDataAggregator(window_seconds=5, fps=30.0)
+    if _POSE_MODEL is None:
         with suppress_stderr():
-            state["pose_model"] = mp_pose.Pose(
+            _POSE_MODEL = mp_pose.Pose(
                 static_image_mode=False,
                 model_complexity=0,  # Fastest model
                 enable_segmentation=False,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5
             )
-    
-    # Initialize face model for stress detection
-    if "face_model" not in state:
+    if _FACE_MODEL is None:
         with suppress_stderr():
-            state["face_model"] = mp_face_mesh.FaceMesh(
+            _FACE_MODEL = mp_face_mesh.FaceMesh(
                 static_image_mode=False,
                 max_num_faces=1,
                 refine_landmarks=True,
@@ -1204,6 +1379,18 @@ def detect_pose_node(state: AgentState) -> AgentState:
         state["status"] = "no_frame"
         return state
 
+    # Count only processed frames and track processing FPS
+    state["frame_count"] = state.get("frame_count", 0) + 1
+    if not hasattr(detect_pose_node, "_fps_log"):
+        detect_pose_node._fps_log = {"last_time": time.time(), "last_count": state["frame_count"]}
+    if state["frame_count"] % 60 == 0:
+        now = time.time()
+        delta_t = now - detect_pose_node._fps_log["last_time"]
+        delta_c = state["frame_count"] - detect_pose_node._fps_log["last_count"]
+        fps_proc = delta_c / max(1e-6, delta_t)
+        print(f"⏱️ Processing FPS (detect node): {fps_proc:.1f} fps")
+        detect_pose_node._fps_log = {"last_time": now, "last_count": state["frame_count"]}
+
     try:
         # Additional safety: Check if frame is valid before processing
         if frame is None or frame.size == 0:
@@ -1229,7 +1416,7 @@ def detect_pose_node(state: AgentState) -> AgentState:
         shoulder_visibility = {"left": 0.0, "right": 0.0}
         
         with suppress_stderr():
-            pose_results = state["pose_model"].process(rgb_frame)
+            pose_results = _POSE_MODEL.process(rgb_frame)
             
             # IMMEDIATE cleanup of pose_results to prevent C++ memory accumulation
             pose_landmarks = None
@@ -1251,8 +1438,6 @@ def detect_pose_node(state: AgentState) -> AgentState:
             del pose_results
             
             if pose_detected:
-                state["pose_landmarks"] = pose_landmarks
-                
                 # Use the landmarks we already extracted
                 selected_pose_coords = []
                 
@@ -1342,9 +1527,9 @@ def detect_pose_node(state: AgentState) -> AgentState:
                                     print(f"   ⚠️ Memory profiling failed: {e}")
                                 
                                 # Clear breathing tracker buffer
-                                if "breathing_tracker" in state and state["breathing_tracker"]:
+                                if _BREATHING_TRACKER is not None:
                                     try:
-                                        tracker = state["breathing_tracker"]
+                                        tracker = _BREATHING_TRACKER
                                         if hasattr(tracker, 'breathing_signal') and len(tracker.breathing_signal) > 0:
                                             print(f"   Clearing breathing tracker buffer (had {len(tracker.breathing_signal)} points)")
                                             tracker.breathing_signal.clear()
@@ -1355,18 +1540,18 @@ def detect_pose_node(state: AgentState) -> AgentState:
                                         print(f"   ⚠️ Error clearing breathing tracker: {bt_error}")
                                 
                                 # Clear feature extractor data
-                                if "feature_extractor" in state and state["feature_extractor"]:
+                                if _FEATURE_EXTRACTOR is not None:
                                     try:
-                                        fe = state["feature_extractor"]
+                                        fe = _FEATURE_EXTRACTOR
                                         # Clear any internal buffers the feature extractor might have
                                         print("   ✅ Feature extractor cleared")
                                     except Exception as fe_error:
                                         print(f"   ⚠️ Error clearing feature extractor: {fe_error}")
                                 
                                 # Clear ML aggregator buffer (this is the big one!)
-                                if "ml_aggregator" in state and state["ml_aggregator"]:
+                                if _ML_AGGREGATOR is not None:
                                     try:
-                                        aggregator = state["ml_aggregator"]
+                                        aggregator = _ML_AGGREGATOR
                                         print(f"   Clearing ML aggregator buffer (had {len(aggregator.data_buffer)} frames)")
                                         aggregator.data_buffer.clear()
                                         print("   ✅ ML aggregator buffer cleared")
@@ -1414,12 +1599,21 @@ def detect_pose_node(state: AgentState) -> AgentState:
                     except Exception as mem_error:
                         print(f"⚠️ Memory monitoring error: {mem_error}")
                 
-                breathing_result = state["breathing_tracker"].update(
-                    timestamp=landmark_data["timestamp"],
-                    nose=(nose.x, nose.y, nose.z),
-                    left_shoulder=(left_shoulder.x, left_shoulder.y, left_shoulder.z),
-                    right_shoulder=(right_shoulder.x, right_shoulder.y, right_shoulder.z)
-                )
+                # Require reasonable shoulder visibility to update breathing (reduces noise)
+                if (shoulder_visibility["left"] > 0.5 and shoulder_visibility["right"] > 0.5):
+                    breathing_result = _BREATHING_TRACKER.update(
+                        timestamp=landmark_data["timestamp"],
+                        nose=(nose.x, nose.y, nose.z),
+                        left_shoulder=(left_shoulder.x, left_shoulder.y, left_shoulder.z),
+                        right_shoulder=(right_shoulder.x, right_shoulder.y, right_shoulder.z)
+                    )
+                else:
+                    breathing_result = {
+                        "bpm": 0.0,
+                        "confidence": 0.0,
+                        "calibrated": _BREATHING_TRACKER.is_calibrated if _BREATHING_TRACKER else False,
+                        "status": "low_visibility"
+                    }
                 
                 # Debug breathing detection issues
                 if state["frame_count"] % 30 == 1:
@@ -1456,14 +1650,14 @@ def detect_pose_node(state: AgentState) -> AgentState:
             pass
         
         with suppress_stderr():
-            face_results = state["face_model"].process(rgb_frame)
+            face_results = _FACE_MODEL.process(rgb_frame)
             
             # IMMEDIATE extraction and cleanup to prevent C++ memory accumulation
             face_landmarks = None
             if face_results.multi_face_landmarks:
                 # Extract what we need immediately
                 face_landmarks = face_results.multi_face_landmarks[0]
-                state["face_landmarks"] = face_landmarks
+                
             
             # Immediately delete face_results to free C++ memory
             del face_results
@@ -1472,8 +1666,11 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 
                 selected_face_coords = []
                 
-                left_eye_indices = [249, 263, 362, 373, 374, 380, 381, 382, 384, 385, 386, 387, 388, 390, 398, 466]
-                right_eye_indices = [7, 33, 133, 144, 145, 153, 154, 155, 157, 158, 159, 160, 161, 163, 173, 246]
+                # Corrected eye landmark indices (MediaPipe FaceMesh 468 topology)
+                # Left eye (subject's left, image right): corners 33 (outer), 133 (inner), top ~159, bottom ~145
+                left_eye_indices = [33, 133, 159, 145, 160, 158, 144, 153, 163, 7, 246]
+                # Right eye: corners 362 (inner), 263 (outer), top ~386, bottom ~374
+                right_eye_indices = [362, 263, 386, 374, 385, 387, 380, 373, 390, 466]
                 left_eyebrow_indices = [276, 282, 283, 285, 293, 295, 296, 300, 334, 336]
                 right_eyebrow_indices = [46, 52, 53, 55, 63, 65, 66, 70, 105, 107]
                 lips_indices = [0, 13, 14, 17, 37, 39, 40, 61, 78, 80, 81, 82, 84, 87, 88, 91, 95, 146, 178, 181, 185, 191, 267, 269, 270, 291, 308, 310, 311, 312, 314, 317, 318, 321, 324, 375, 402, 405, 409, 415]
@@ -1507,6 +1704,18 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 total_face_landmarks = (left_eye_count + right_eye_count + left_eyebrow_count + 
                                       right_eyebrow_count + nose_count + lips_count + face_oval_count)
                 
+                # Build an index_map for essential eye openness landmarks (EAR-style)
+                # Include multiple vertical pairs to make EAR more robust to noise
+                essential_indices = set([
+                    33, 133, 145, 159, 160, 144,      # Left eye: corners + two vertical pairs
+                    362, 263, 374, 386, 385, 380       # Right eye: corners + two vertical pairs
+                ])
+                index_map = {}
+                for idx in essential_indices:
+                    if idx < len(face_landmarks.landmark):
+                        lm = face_landmarks.landmark[idx]
+                        index_map[idx] = [lm.x, lm.y, lm.z]
+
                 landmark_data["face_landmarks"] = {
                     "coordinates": selected_face_coords,
                     "num_landmarks": total_face_landmarks,
@@ -1519,7 +1728,8 @@ def detect_pose_node(state: AgentState) -> AgentState:
                         "lips": lips_count,
                         "face_oval": face_oval_count
                     },
-                    "feature_vector_length": len(selected_face_coords)
+                    "feature_vector_length": len(selected_face_coords),
+                    "index_map": index_map
                 }
             
             # Immediate cleanup after face processing to prevent memory accumulation
@@ -1537,22 +1747,35 @@ def detect_pose_node(state: AgentState) -> AgentState:
             del rgb_frame
         except Exception:
             pass
-        
+
+        # Store minimal data in state and compute ML features
         state["landmark_data"] = landmark_data
-        
-        ml_features = state["feature_extractor"].extract_features(landmark_data)
+        ml_features = _FEATURE_EXTRACTOR.extract_features(landmark_data)
         landmark_data["ml_features"] = ml_features
         
-        # CRITICAL: Clear landmark_data from state immediately after ML processing to prevent accumulation
-        # Keep only essential data, clear the massive coordinate arrays
+        # Periodic sanity log of key features to catch flatlines
+        if state.get("frame_count", 0) % 60 == 1:
+            bf = ml_features.get("breathing_features", {})
+            ef = ml_features.get("eye_features", {})
+            pf = ml_features.get("posture_features", {})
+            ff = ml_features.get("facial_features", {})
+            print(
+                "🧪 Features sample — "
+                f"Breathing: {bf.get('bpm', 0):.1f} bpm (conf {bf.get('confidence', 0):.2f}), "
+                f"Eyes: L/R {ef.get('left_eye_openness', 0):.3f}/{ef.get('right_eye_openness', 0):.3f}, "
+                f"Posture: shoulder_avg {pf.get('shoulder_height_avg', 0):.3f}, "
+                f"Facial: jaw_width {ff.get('jaw_width', 0):.3f}"
+            )
+        
+        # Replace with minimal footprint for next node
         essential_data = {
             "pose_detected": landmark_data.get("pose_landmarks") is not None,
             "face_detected": landmark_data.get("face_landmarks") is not None,
             "breathing": landmark_data.get("breathing", {}),
-            "ml_features": ml_features,  # Keep ML features for export
-            "timestamp": landmark_data.get("timestamp")
+            "ml_features": ml_features,
+            "timestamp": landmark_data.get("timestamp"),
         }
-        state["landmark_data"] = essential_data  # Replace with minimal data
+        state["landmark_data"] = essential_data
         
         has_pose = landmark_data["pose_landmarks"] is not None
         has_face = landmark_data["face_landmarks"] is not None
@@ -1560,7 +1783,6 @@ def detect_pose_node(state: AgentState) -> AgentState:
         if has_pose or has_face:
             state["last_detection_time"] = time.time()
             state["status"] = "landmarks_detected"
-            
             frame_count = state.get("frame_count", 0)
             if frame_count % 60 == 1:
                 status_msg = []
@@ -1568,7 +1790,6 @@ def detect_pose_node(state: AgentState) -> AgentState:
                     status_msg.append(f"Pose({landmark_data['pose_landmarks']['num_landmarks']} pts: nose+shoulders)")
                 if has_face:
                     status_msg.append(f"Face({landmark_data['face_landmarks']['num_landmarks']} pts: eyes+eyebrows+nose+lips+oval)")
-                
                 breathing = landmark_data.get("breathing", {})
                 if breathing.get("calibrated"):
                     bpm = breathing.get("bpm", 0)
@@ -1577,51 +1798,21 @@ def detect_pose_node(state: AgentState) -> AgentState:
                 else:
                     breath_status = breathing.get("status", "init")
                     status_msg.append(f"Breathing({breath_status})")
-                
-                stress_analysis = landmark_data.get("stress_analysis", {})
-                if stress_analysis.get("calibrated", False):
-                    stress_score = stress_analysis.get("overall_stress_score", 0)
-                    stress_conf = stress_analysis.get("confidence", 0)
-                    stress_level = "HIGH" if stress_score > 0.7 else "MED" if stress_score > 0.4 else "LOW"
-                    status_msg.append(f"Stress({stress_level}:{stress_score:.2f}, conf:{stress_conf:.2f})")
-                else:
-                    status_msg.append("Stress(calibrating)")
-                
                 print(f"🎯 FOCUSED ML LANDMARKS + STRESS ANALYSIS - {' + '.join(status_msg)}")
-                if has_pose:
-                    coords = landmark_data['pose_landmarks']['coordinates']
-                    nose_x, nose_y = coords[0], coords[1]
-                    print(f"   Sample pose: nose=({nose_x:.3f}, {nose_y:.3f})")
-                
-                if has_face:
-                    total_features = landmark_data['face_landmarks']['feature_vector_length']
-                    breakdown = landmark_data['face_landmarks']['feature_breakdown']
-                    print(f"   Face features: {total_features} coords from {sum(breakdown.values())} landmarks")
-                
-                if stress_analysis.get("calibrated", False):
-                    breathing_stress = stress_analysis["breathing_indicators"]["stress_level"]
-                    facial_tension = stress_analysis["facial_tension"]["overall_tension"]
-                    eye_strain = stress_analysis["eye_strain"]["strain_level"]
-                    posture_stress = stress_analysis["posture_stress"]["stress_level"]
-                    print(f"   Stress breakdown: Breathing:{breathing_stress:.2f} Facial:{facial_tension:.2f} Eyes:{eye_strain:.2f} Posture:{posture_stress:.2f}")
-                
         else:
-            state["pose_landmarks"] = None
-            state["face_landmarks"] = None
             state["status"] = "no_landmarks"
             frame_count = state.get("frame_count", 0)
             if frame_count % 60 == 0:
                 print("� No landmarks detected")
-        
+
+        # Detection stats
         if not hasattr(detect_pose_node, 'detection_stats'):
             detect_pose_node.detection_stats = {"pose_success": 0, "face_success": 0, "total_frames": 0}
-        
         detect_pose_node.detection_stats["total_frames"] += 1
         if has_pose:
             detect_pose_node.detection_stats["pose_success"] += 1
         if has_face:
             detect_pose_node.detection_stats["face_success"] += 1
-        
         if state.get("frame_count", 0) % 100 == 0:
             stats = detect_pose_node.detection_stats
             pose_rate = (stats["pose_success"] / stats["total_frames"]) * 100 if stats["total_frames"] > 0 else 0
@@ -1635,32 +1826,18 @@ def detect_pose_node(state: AgentState) -> AgentState:
         state["pose_landmarks"] = None
         state["face_landmarks"] = None
         state["landmark_data"] = None
-        
-        # Reinitialize MediaPipe models on error to prevent corruption
-        if state["frame_count"] % 50 == 0:  # Every 50 frames
-            print("🔄 Reinitializing MediaPipe models due to repeated errors...")
-            try:
-                if "pose_model" in state:
-                    del state["pose_model"]
-                if "face_model" in state:
-                    del state["face_model"]
-            except Exception as cleanup_error:
-                print(f"⚠️ Error during model cleanup: {cleanup_error}")
+        # We keep singletons alive; if persistent errors, a higher-level restart will handle it
     
     # Aggressive per-frame cleanup to prevent memory accumulation
     try:
-        if state["frame_count"] % 5 == 0:  # Every 5 frames
+        if state.get("frame_count", 0) % 5 == 0:  # Every 5 frames
             import gc
             gc.collect()  # Light garbage collection
-        
-        # Always cleanup frame arrays and MediaPipe results to prevent accumulation
+        # Cleanup local arrays
         if 'rgb_frame' in locals():
             del rgb_frame
         if 'frame' in locals() and frame is not None:
             del frame
-        # Clear frame from state to prevent accumulation
-        if "frame" in state:
-            del state["frame"]
     except Exception:
         pass
     
@@ -1674,7 +1851,8 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
     has_landmarks = landmark_data is not None
     
     try:
-        aggregated_data = state["ml_aggregator"].add_frame_data({
+        global _ML_AGGREGATOR
+        aggregated_data = _ML_AGGREGATOR.add_frame_data({
             "timestamp": timestamp,
             "ml_features": landmark_data.get("ml_features", {}) if has_landmarks else {},
             "breathing": landmark_data.get("breathing", {}) if has_landmarks else {},
@@ -1719,72 +1897,38 @@ def export_landmark_data_node(state: AgentState) -> AgentState:
             
             print(f"   📁 Saved to: ml_training_data/window_{window_id:06d}_ml_features.json")
             
-            # CRITICAL: Clear memory caches after export to prevent memory buildup and crashes
-            print("🧹 AGGRESSIVE MEMORY CLEANUP after window export...")
+            # CRITICAL: Post-export memory hygiene without losing signal/baselines
+            print("🧹 Post-export cleanup (buffers only, keep calibrations and baselines)")
             
-            # Clear breathing tracker cache
-            if "breathing_tracker" in state and state["breathing_tracker"]:
+            # Keep breathing tracker calibration and rolling signal; just trim if anything overflowed
+            if _BREATHING_TRACKER is not None:
                 try:
-                    tracker = state["breathing_tracker"]
-                    print(f"   Clearing breathing tracker buffers (had {len(tracker.timestamps)} timestamps)")
-                    tracker.timestamps.clear()
-                    tracker.head_y.clear()
-                    tracker.shoulder_y.clear()
-                    tracker.torso_center_y.clear()
-                    tracker.combined_signal.clear()
-                    tracker.peaks.clear()
-                    tracker.valleys.clear()
-                    # Reset calibration to prevent accumulated error
-                    tracker.is_calibrated = False
-                    tracker.calibration_frames = 0
-                    print("   ✅ Breathing tracker buffers cleared")
+                    tracker = _BREATHING_TRACKER
+                    # Deques have maxlen, so they self-trim; no action needed besides sanity print
+                    print(f"   Breathing tracker state: {len(tracker.timestamps)} pts, calibrated={tracker.is_calibrated}")
                 except Exception as bt_error:
-                    print(f"   ⚠️ Error clearing breathing tracker: {bt_error}")
+                    print(f"   ⚠️ Breathing tracker inspection error: {bt_error}")
             
-            # Clear feature extractor cache
-            if "feature_extractor" in state and state["feature_extractor"]:
+            # Feature extractor: keep baselines and short histories intact
+            if _FEATURE_EXTRACTOR is not None:
                 try:
-                    extractor = state["feature_extractor"]
-                    if hasattr(extractor, 'history_buffer'):
-                        print(f"   Clearing feature extractor history (had {len(extractor.history_buffer)} entries)")
-                        extractor.history_buffer.clear()
-                        print("   ✅ Feature extractor history cleared")
+                    extractor = _FEATURE_EXTRACTOR
+                    # No explicit buffer to clear; histories are bounded deques
+                    print("   Feature extractor state preserved (baselines + bounded histories)")
                 except Exception as fe_error:
-                    print(f"   ⚠️ Error clearing feature extractor: {fe_error}")
+                    print(f"   ⚠️ Feature extractor inspection error: {fe_error}")
             
-            # Clear ML aggregator buffer (this is the big one!)
-            if "ml_aggregator" in state and state["ml_aggregator"]:
+            # ML aggregator buffer (bounded) – clear to start a fresh window
+            if _ML_AGGREGATOR is not None:
                 try:
-                    aggregator = state["ml_aggregator"]
+                    aggregator = _ML_AGGREGATOR
                     print(f"   Clearing ML aggregator buffer (had {len(aggregator.data_buffer)} frames)")
                     aggregator.data_buffer.clear()
                     print("   ✅ ML aggregator buffer cleared")
                 except Exception as agg_error:
                     print(f"   ⚠️ Error clearing ML aggregator: {agg_error}")
             
-            # SAFER CLEANUP: Clear buffers but don't recreate components
-            print("   🧹 SAFE CLEANUP: Clearing buffers without component recreation...")
-            try:
-                # Just clear buffers, don't recreate objects
-                if "breathing_tracker" in state and state["breathing_tracker"]:
-                    tracker = state["breathing_tracker"]
-                    if hasattr(tracker, 'breathing_signal'):
-                        tracker.breathing_signal.clear()
-                    if hasattr(tracker, 'timestamps'):
-                        tracker.timestamps.clear()
-                    if hasattr(tracker, 'movement_buffer'):
-                        tracker.movement_buffer.clear()
-                
-                # Clear feature extractor internal state if any
-                if "feature_extractor" in state and state["feature_extractor"]:
-                    # Don't recreate, just clear any internal buffers
-                    pass
-                
-                # Clear ML aggregator buffer (already done above)
-                
-                print("   ✅ Component buffers cleared safely")
-            except Exception as safe_error:
-                print(f"   ⚠️ Error in safe cleanup: {safe_error}")
+            # No component recreation; models and learned baselines remain warm
             
             # DON'T close MediaPipe models - just clear stored results
             try:
@@ -1907,16 +2051,12 @@ def main():
         try:
             agent = create_agent_graph()
             initial_state: AgentState = {
-                "frame": None,
                 "pose_landmarks": None,
                 "face_landmarks": None,
                 "frame_count": 0,
                 "last_detection_time": 0.0,
                 "status": "starting",
                 "landmark_data": None,
-                "breathing_tracker": None,
-                "feature_extractor": None,
-                "ml_aggregator": None
             }
             
             print(f"🔄 Agent running... (Attempt {restart_counter + 1}/{max_restarts}, Ctrl+C to stop)")
