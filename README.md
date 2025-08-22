@@ -15,7 +15,7 @@ Stress, anxiety, and other emotions can be detrimental to people's health and we
 
 ## What It Does
 
-Dev Agent is an AI Agent that estimates stress and mindfulness based on facial and audio indicators. It is trained on an ML model to provide assistance such as:
+Dev Agent is an AI Agent that estimates stress and mindfulness based on face and body indicators. It is trained on an ML model to provide assistance such as:
 
 - Providing notifications during virtual meetings to check your emotions
 - Suggesting a quick relaxation exercise to reduce stress and anxiety
