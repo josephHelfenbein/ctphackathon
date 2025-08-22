@@ -107,3 +107,5 @@ websockets==15.0.1
 joblib
 psutil
 scikit-learn==1.5.1
+pyarrow
+fastparquet

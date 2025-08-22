@@ -121,10 +121,6 @@ def main():
     X = df[features].fillna(medians).values
     y = df["y"].values
     groups = df["subject_id"].astype(str).values
-
-    gkf = GroupKFold(n_splits=min(5, len(set(groups))))
-    oof = np.zeros(len(df))
-
     rf = RandomForestClassifier(
         n_estimators=args.n_estimators,
         max_depth=None,
@@ -133,24 +129,48 @@ def main():
         n_jobs=-1,
         random_state=args.random_state,
     )
-
-    for fold, (tr, va) in enumerate(gkf.split(X, y, groups)):
-        rf.fit(X[tr], y[tr])
-        proba = rf.predict_proba(X[va])[:, 1]
-        oof[va] = proba
-        auc = roc_auc_score(y[va], proba)
-        bal = balanced_accuracy_score(y[va], (proba > 0.5).astype(int))
-        f1 = f1_score(y[va], (proba > 0.5).astype(int))
-        print(f"Fold {fold} AUC={auc:.3f} BalAcc={bal:.3f} F1={f1:.3f}")
-
-    overall_auc = roc_auc_score(y, oof)
-    overall_bal = balanced_accuracy_score(y, (oof > 0.5).astype(int))
-    overall_f1 = f1_score(y, (oof > 0.5).astype(int))
-    print(
-        f"OOF AUC={overall_auc:.3f} BalAcc={overall_bal:.3f} F1={overall_f1:.3f}")
-
-    # Fit final model
-    rf.fit(X, y)
+    if "split" in df.columns and set(df["split"]) == {"train", "test"}:
+        # Use train/test split from dataset
+        train_idx = df["split"] == "train"
+        test_idx = df["split"] == "test"
+        rf.fit(X[train_idx], y[train_idx])
+        proba = rf.predict_proba(X[test_idx])[:, 1]
+        auc = roc_auc_score(y[test_idx], proba)
+        bal = balanced_accuracy_score(y[test_idx], (proba > 0.5).astype(int))
+        f1 = f1_score(y[test_idx], (proba > 0.5).astype(int))
+        print(f"Test AUC={auc:.3f} BalAcc={bal:.3f} F1={f1:.3f}")
+        overall_auc = auc
+        overall_bal = bal
+        overall_f1 = f1
+    elif len(set(groups)) > 1:
+        # Use GroupKFold CV if multiple subjects
+        gkf = GroupKFold(n_splits=min(5, len(set(groups))))
+        oof = np.zeros(len(df))
+        for fold, (tr, va) in enumerate(gkf.split(X, y, groups)):
+            rf.fit(X[tr], y[tr])
+            proba = rf.predict_proba(X[va])[:, 1]
+            oof[va] = proba
+            auc = roc_auc_score(y[va], proba)
+            bal = balanced_accuracy_score(y[va], (proba > 0.5).astype(int))
+            f1 = f1_score(y[va], (proba > 0.5).astype(int))
+            print(f"Fold {fold} AUC={auc:.3f} BalAcc={bal:.3f} F1={f1:.3f}")
+        overall_auc = roc_auc_score(y, oof)
+        overall_bal = balanced_accuracy_score(y, (oof > 0.5).astype(int))
+        overall_f1 = f1_score(y, (oof > 0.5).astype(int))
+        print(f"OOF AUC={overall_auc:.3f} BalAcc={overall_bal:.3f} F1={overall_f1:.3f}")
+        # Fit final model
+        rf.fit(X, y)
+    else:
+        # Only one subject, no CV possible
+        rf.fit(X, y)
+        proba = rf.predict_proba(X)[:, 1]
+        auc = roc_auc_score(y, proba)
+        bal = balanced_accuracy_score(y, (proba > 0.5).astype(int))
+        f1 = f1_score(y, (proba > 0.5).astype(int))
+        print(f"Single subject: AUC={auc:.3f} BalAcc={bal:.3f} F1={f1:.3f}")
+        overall_auc = auc
+        overall_bal = bal
+        overall_f1 = f1
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
