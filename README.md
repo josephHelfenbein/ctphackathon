@@ -35,7 +35,7 @@ To run the backend, do
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate.fish
+source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
